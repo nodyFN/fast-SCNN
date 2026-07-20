@@ -634,6 +634,21 @@ def main() -> None:
         else:
             cfg.early_stopping_enabled = False
 
+    # Generate timestamp and redirect config directories
+    from datetime import datetime
+    if cfg.resume:
+        resume_path = Path(cfg.resume)
+        timestamp = resume_path.parent.name
+        # Fallback to new timestamp if parent dir is not a timestamp
+        if timestamp == "checkpoints" or not timestamp:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    cfg.checkpoint_dir = cfg.checkpoint_dir / timestamp
+    cfg.training_image_dir = cfg.training_image_dir / timestamp
+    cfg.tensorboard_dir = cfg.tensorboard_dir / timestamp
+
     if args.smoke_test:
         run_smoke_test(cfg)
     else:
