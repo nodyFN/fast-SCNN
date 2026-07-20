@@ -1,0 +1,52 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+
+# === OS & IDE ===
+.DS_Store
+.DS_Store?
+Thumbs.db
+.vscode/
+.idea/
+
+# === Temporary Downloads ===
+/temp_download/
+
+# === Project Outputs & Structure Preservations (Ignore content, keep folder structure via .gitkeep) ===
+
+# Dataset structures
+/data/**/images/*
+!/data/**/images/.gitkeep
+
+/data/**/masks/*
+!/data/**/masks/.gitkeep
+
+# Checkpoint weights
+/checkpoints/*
+!/checkpoints/.gitkeep
+
+# Visualisation graphs and curves
+/training_results/*
+!/training_results/.gitkeep
+
+# TensorBoard logs
+/runs/*
+!/runs/.gitkeep
+
+# Exported ONNX models
+/exports/*
+!/exports/.gitkeep
+
+# Inference outputs
+/inference_results/*
+!/inference_results/.gitkeep
+
+# Evaluation logs and outputs
+/evaluation_results/*
+!/evaluation_results/.gitkeep
