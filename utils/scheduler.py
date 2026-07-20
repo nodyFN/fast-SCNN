@@ -60,6 +60,26 @@ class PolyLR(_LRScheduler):
             for base_lr in self.base_lrs
         ]
 
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        # Remove hyperparameters from saved state so we don't restore them,
+        # allowing the new run's configuration to take precedence
+        state.pop("total_iters", None)
+        state.pop("power", None)
+        state.pop("min_lr", None)
+        return state
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        # Preserve the new configuration parameters
+        saved_attrs = {
+            "total_iters": self.total_iters,
+            "power": self.power,
+            "min_lr": self.min_lr,
+        }
+        super().load_state_dict(state_dict)
+        # Restore them back to the active configuration
+        self.__dict__.update(saved_attrs)
+
 
 def build_scheduler(
     name: str,
