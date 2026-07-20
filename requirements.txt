@@ -1,0 +1,12 @@
+torch
+torchvision
+albumentations
+opencv-python-headless
+numpy
+tqdm
+tensorboard
+matplotlib
+onnx
+onnxruntime
+pillow
+pytest

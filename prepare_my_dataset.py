@@ -57,6 +57,16 @@ def main():
     if not src_root.exists():
         raise FileNotFoundError(f"Source directory '{src_root}' not found.")
 
+    # Clean up destination directory if it exists (keep folder structure and .gitkeep files)
+    if dest_root.exists():
+        print(f"Destination directory '{dest_root}' already exists. Overwriting (cleaning old files)...")
+        for p in list(dest_root.rglob("*")):
+            if p.is_file() and p.name != ".gitkeep":
+                try:
+                    p.unlink()
+                except Exception as e:
+                    print(f"Warning: Could not delete {p}: {e}")
+
     # 2. Collect files from FG and NO_FG
     print("Collecting files...")
     fg_pairs = collect_pairs(src_root / "FG", src_root / "FG_masks", prefix="fg_")
