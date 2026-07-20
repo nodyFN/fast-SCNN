@@ -50,3 +50,6 @@ Thumbs.db
 # Evaluation logs and outputs
 /evaluation_results/*
 !/evaluation_results/.gitkeep
+
+# my dataset
+my_dataset

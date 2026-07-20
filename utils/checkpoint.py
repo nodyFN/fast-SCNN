@@ -61,6 +61,11 @@ def save_checkpoint(
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent), suffix=".tmp"
     )
+
+    
+    import os
+    os.close(tmp_fd)
+
     try:
         torch.save(state, tmp_path)
         Path(tmp_path).replace(path)
@@ -148,3 +153,4 @@ def _strip_module_prefix(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         else:
             cleaned[k] = v
     return cleaned
+
