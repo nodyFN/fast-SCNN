@@ -20,12 +20,16 @@ Thumbs.db
 
 # === Project Outputs & Structure Preservations (Ignore content, keep folder structure via .gitkeep) ===
 
-# Dataset structures
+# Dataset structures (My Dataset & DUTS)
 /data/**/images/*
 !/data/**/images/.gitkeep
-
 /data/**/masks/*
 !/data/**/masks/.gitkeep
+
+/duts_data/**/images/*
+!/duts_data/**/images/.gitkeep
+/duts_data/**/masks/*
+!/duts_data/**/masks/.gitkeep
 
 # Checkpoint weights
 /checkpoints/*
@@ -51,5 +55,6 @@ Thumbs.db
 /evaluation_results/*
 !/evaluation_results/.gitkeep
 
-# my dataset
-my_dataset
+# Local user source datasets
+my_dataset/
+DUTS/

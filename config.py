@@ -112,6 +112,7 @@ class Config:
 
     # ── Device ────────────────────────────────────────────────────────
     device: str = "auto"  # "auto" | "cuda" | "cpu"
+    allow_threshold: bool = False  # Set to True to allow thresholding grayscale masks
 
     # ── Checkpoint resume ─────────────────────────────────────────────
     resume: Optional[str] = None  # path to checkpoint to resume from

@@ -349,8 +349,8 @@ def train(cfg: Config) -> None:
     )
     val_transform = build_val_transform(cfg.val_height, cfg.val_width)
 
-    train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform)
-    val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform)
+    train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform, allow_threshold=cfg.allow_threshold)
+    val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform, allow_threshold=cfg.allow_threshold)
     logger.info(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     train_loader = build_dataloader(
@@ -575,6 +575,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--early-stopping", type=int, default=None,
                    help="Enable early stopping with given patience (0=disable)")
+    p.add_argument("--allow-threshold", action="store_true", default=None,
+                   help="Allow thresholding grayscale masks to binary (0/1)")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a minimal smoke test with synthetic data")
     return p.parse_args()
@@ -633,6 +635,8 @@ def main() -> None:
             cfg.early_stopping_patience = args.early_stopping
         else:
             cfg.early_stopping_enabled = False
+    if args.allow_threshold is not None:
+        cfg.allow_threshold = args.allow_threshold
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

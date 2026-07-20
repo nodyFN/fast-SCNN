@@ -37,7 +37,7 @@ def collect_duts_pairs(img_dir: Path, mask_dir: Path) -> List[Dict[str, Path]]:
 def main():
     parser = argparse.ArgumentParser(description="Split and copy DUTS dataset into project data directory")
     parser.add_argument("--src", type=str, required=True, help="Path to the 'DUTS' folder")
-    parser.add_argument("--dest", type=str, default="data", help="Output directory path (default: data)")
+    parser.add_argument("--dest", type=str, default="duts_data", help="Output directory path (default: data)")
     parser.add_argument("--val-ratio", type=float, default=0.05, help="Ratio of TR dataset to split for val (default: 0.05)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
     args = parser.parse_args()

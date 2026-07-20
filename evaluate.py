@@ -46,6 +46,7 @@ def evaluate(
     val_height: int = 512,
     val_width: int = 1024,
     num_vis_samples: int = 8,
+    allow_threshold: bool = False,
 ) -> None:
     cfg = Config()
     if data_root:
@@ -65,7 +66,7 @@ def evaluate(
     # Dataset
     split_dir = cfg.val_dir if split == "val" else cfg.test_dir
     transform = build_val_transform(val_height, val_width)
-    dataset = SegmentationDataset(split_dir, transform=transform)
+    dataset = SegmentationDataset(split_dir, transform=transform, allow_threshold=allow_threshold)
     logger.info(f"Evaluating on {split} split: {len(dataset)} samples")
 
     dataloader = build_dataloader(
@@ -166,6 +167,8 @@ def main() -> None:
     p.add_argument("--val-height", type=int, default=512)
     p.add_argument("--val-width", type=int, default=1024)
     p.add_argument("--num-vis-samples", type=int, default=8)
+    p.add_argument("--allow-threshold", action="store_true",
+                   help="Allow thresholding grayscale masks to binary (0/1)")
     args = p.parse_args()
 
     evaluate(
@@ -180,6 +183,7 @@ def main() -> None:
         val_height=args.val_height,
         val_width=args.val_width,
         num_vis_samples=args.num_vis_samples,
+        allow_threshold=args.allow_threshold,
     )
 
 
