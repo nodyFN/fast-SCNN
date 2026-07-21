@@ -426,8 +426,8 @@ class SobelBoundaryLoss(nn.Module):
 
     def _edge_magnitude(self, x: torch.Tensor) -> torch.Tensor:
         """Compute edge magnitude from [B, 1, H, W] input."""
-        edge_x = F.conv2d(x, self.sobel_x, padding=1)
-        edge_y = F.conv2d(x, self.sobel_y, padding=1)
+        edge_x = F.conv2d(x, self.sobel_x.to(dtype=x.dtype), padding=1)
+        edge_y = F.conv2d(x, self.sobel_y.to(dtype=x.dtype), padding=1)
         return torch.sqrt(edge_x.square() + edge_y.square() + self.eps)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
