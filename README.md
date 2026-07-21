@@ -334,9 +334,15 @@ python train.py --profile project --data-root duts_data --allow-threshold
 ```
 
 ### Focal Loss Tuning
-You can adjust the weight of Focal Loss in the combined loss function directly from the command line:
-```bash
-python train.py --profile project --data-root data --focal-weight 0.5
+You can enable and adjust the weight of Focal Loss in the combined loss function by modifying `focal_weight` in `config.py` (specifically under the active profile's configuration function, such as `get_project_config()`):
+```python
+# In config.py:
+def get_project_config() -> Config:
+    return Config(
+        ...
+        focal_weight=0.5,  # Enable Focal Loss and set its weight
+        ...
+    )
 ```
 
 ### Transfer Learning (轉移學習 / 微調)
