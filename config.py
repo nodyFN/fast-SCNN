@@ -116,6 +116,7 @@ class Config:
 
     # ── Checkpoint resume ─────────────────────────────────────────────
     resume: Optional[str] = None  # path to checkpoint to resume from
+    weights: Optional[str] = None  # path to pre-trained weights for transfer learning (weights-only)
 
     # ── Early stopping ────────────────────────────────────────────────
     early_stopping_patience: int = 50  # [PROJECT DECISION] 0 = disabled

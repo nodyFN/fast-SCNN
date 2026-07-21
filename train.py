@@ -373,6 +373,11 @@ def train(cfg: Config) -> None:
     total_p, trainable_p = count_parameters(model)
     logger.info(f"Parameters: total={total_p:,}  trainable={trainable_p:,}")
 
+    # Load pre-trained weights (Transfer Learning / weights-only)
+    if getattr(cfg, "weights", None):
+        load_checkpoint(cfg.weights, model, map_location=device, weights_only=True)
+        logger.info(f"Loaded pre-trained weights from {cfg.weights} for Transfer Learning.")
+
     # Optimizer, scheduler, scaler
     optimizer = build_optimizer(model, cfg)
     total_iters = len(train_loader) * cfg.epochs
@@ -571,6 +576,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-aux", action="store_true", help="Disable auxiliary heads")
     p.add_argument("--no-amp", action="store_true", help="Disable AMP")
     p.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
+    p.add_argument("--weights", type=str, default=None,
+                   help="Path to pre-trained weights for transfer learning / fine-tuning (weights-only)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--early-stopping", type=int, default=None,
@@ -625,6 +632,8 @@ def main() -> None:
         cfg.amp = False
     if args.resume:
         cfg.resume = args.resume
+    if args.weights:
+        cfg.weights = args.weights
     if args.seed is not None:
         cfg.seed = args.seed
     if args.device:
