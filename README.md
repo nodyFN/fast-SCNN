@@ -8,6 +8,12 @@ A complete PyTorch implementation of [Fast-SCNN](https://arxiv.org/abs/1902.0450
 - [Network Architecture Table](#network-architecture-table)
 - [Module Details](#module-details)
 - [Project vs Paper Settings](#project-vs-paper-settings)
+- [FastSCNNSalient (Dual-Head Model)](#fastscnnsalient-dual-head-model)
+  - [Salient Model Architecture](#salient-model-architecture)
+  - [Loss Functions](#salient-loss-functions)
+  - [Gradient Flow](#gradient-flow)
+  - [Salient Model Config](#salient-model-config)
+  - [Salient Model Test & Benchmark](#salient-model-test--benchmark)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Dataset Formats](#dataset-formats)
@@ -214,10 +220,11 @@ fast-SCNN/
 ├── check_mask_value.py   # Utility to inspect mask pixel values
 ├── models/
 │   ├── __init__.py
-│   └── fast_scnn.py      # Complete Fast-SCNN implementation
+│   ├── fast_scnn.py          # Original Fast-SCNN (2-class CE)
+│   └── fast_scnn_salient.py  # Dual-Head Salient Model (1-ch binary)
 ├── utils/
 │   ├── __init__.py
-│   ├── losses.py         # CE, Dice, Focal, Combined loss
+│   ├── losses.py         # CE, Dice, Focal, Combined + Binary losses
 │   ├── metrics.py        # Confusion matrix metrics
 │   ├── scheduler.py      # PolyLR, CosineAnnealing
 │   ├── checkpoint.py     # Save/load checkpoints
@@ -449,6 +456,105 @@ python models/fast_scnn.py --device cuda
 
 # Full TV resolution (1080x1920)
 python models/fast_scnn.py --device cuda --full-res
+```
+
+---
+
+## FastSCNNSalient (Dual-Head Model)
+
+A **Single-Backbone, Dual-Head, Coarse-to-Fine Salient Foreground Segmentation** model optimized for edge devices (TV SoC) with limited DRAM bandwidth.
+
+This model is completely independent from the original `FastSCNN`. It uses **1-channel binary logits** with `BCEWithLogitsLoss`, not the original 2-channel `CrossEntropyLoss`.
+
+### Salient Model Architecture
+
+```
+Input [B, 3, H, W]
+  │
+  ▼
+SharedFastSCNNBackbone (executed ONCE)
+  │  Learning to Downsample
+  │  Global Feature Extractor
+  │  Pyramid Pooling Module
+  │  Feature Fusion Module
+  │
+  └─► F_shared [B, 128, H/8, W/8]
+        │
+        ├──► CoarseHead ──► coarse_logits [B, 1, H, W]
+        │         │
+        │    sigmoid + detach (stop-gradient)
+        │         │
+        │    coarse_prompt [B, 1, H/8, W/8]
+        │         │
+        └──► RefinementHead ◄──┘
+                  │
+                  └──► fine_logits [B, 1, H, W]  (final output)
+```
+
+**Key design constraints:**
+- **Single backbone execution**: the shared backbone runs exactly once per input image.
+- **Internal spatial prompt**: coarse probability is generated internally, no external GT/bbox/SAM prompts.
+- **Stop-gradient**: `coarse_prompt = sigmoid(coarse_logits).detach()` — Fine Loss cannot update CoarseHead through the prompt path.
+- **Broadcasting spatial attention**: `F_attended = F_shared + F_shared × coarse_prompt` uses broadcasting (no `.repeat()`).
+
+**Module details:**
+
+| Module | Structure | Output |
+|---|---|---|
+| `SharedFastSCNNBackbone` | LtD → GFE → PPM → FFM | `[B, 128, H/8, W/8]` |
+| `CoarseHead` | DSConv 128→64 → Dropout → 1×1 Conv 64→1 | `[B, 1, H/8, W/8]` |
+| `RefinementHead` | SpatialAttn → Cat(129ch) → 1×1 Conv 129→64 → DSConv 64→64 → Dropout → 1×1 Conv 64→1 | `[B, 1, H/8, W/8]` |
+
+### Salient Loss Functions
+
+Total loss:
+```
+L_total = λ_coarse × L_coarse + λ_fine × L_fine + λ_boundary × L_boundary
+```
+
+| Loss | Formula | Target |
+|---|---|---|
+| **L_coarse** | `BCEWithLogitsLoss(pos_weight) + BinaryDiceLoss` | High Recall (find all foreground) |
+| **L_fine** | `BinaryFocalLoss(α=0.25, γ=2.0) + BinaryDiceLoss` | High Precision (refine edges) |
+| **L_boundary** | `SobelBoundaryLoss` (L1 on Sobel edge magnitudes, fine only) | Sharp contours |
+
+Default weights: `λ_coarse=1.0`, `λ_fine=1.0`, `λ_boundary=0.5`.
+
+### Gradient Flow
+
+| Loss | Backbone | CoarseHead | RefinementHead |
+|---|---|---|---|
+| Coarse Loss | ✓ updates | ✓ updates | — |
+| Fine Loss | ✓ updates | ✗ blocked by detach | ✓ updates |
+| Boundary Loss | ✓ updates | ✗ blocked by detach | ✓ updates |
+
+### Salient Model Config
+
+All salient model parameters are configurable in `config.py`:
+
+| Field | Default | Description |
+|---|---|---|
+| `coarse_channels` | 64 | CoarseHead intermediate channels |
+| `refinement_channels` | 64 | RefinementHead intermediate channels |
+| `salient_lambda_coarse` | 1.0 | Weight for coarse loss |
+| `salient_lambda_fine` | 1.0 | Weight for fine loss |
+| `salient_lambda_boundary` | 0.5 | Weight for boundary loss |
+| `salient_focal_alpha` | 0.25 | Focal Loss alpha |
+| `salient_focal_gamma` | 2.0 | Focal Loss gamma |
+| `salient_pos_weight` | None | BCEWithLogitsLoss pos_weight |
+
+### Salient Model Test & Benchmark
+
+Run the built-in shape test, gradient flow verification, odd-size test, and FPS benchmark:
+```bash
+# Default resolution (512×1024)
+python models/fast_scnn_salient.py --device cuda
+
+# Full TV resolution (1080×1920)
+python models/fast_scnn_salient.py --device cuda --full-res
+
+# CPU-only test
+python models/fast_scnn_salient.py --device cpu --iterations 5
 ```
 
 ---
