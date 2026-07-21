@@ -31,6 +31,7 @@ class Config:
     # ── Training profile ──────────────────────────────────────────────
     # "paper" → reproduce paper settings; "project" → project-tuned defaults
     profile: str = "project"
+    model: str = "fast_scnn"  # "fast_scnn" | "fast_scnn_salient"
 
     # ── Data paths ────────────────────────────────────────────────────
     data_root: Path = PROJECT_ROOT / "data"

@@ -211,8 +211,7 @@ fast-SCNN/
 ├── README.md
 ├── config.py             # Centralized configuration
 ├── dataset.py            # Dataset + transforms + DataLoader
-├── train.py              # Original Fast-SCNN training script
-├── train_salient.py      # Salient dual-head model training script
+├── train.py              # Training script (supports both models via --model)
 ├── evaluate.py           # Evaluation script
 ├── inference.py          # Single/folder inference
 ├── export.py             # ONNX export + validation
@@ -546,23 +545,23 @@ All salient model parameters are configurable in `config.py`:
 
 ### Salient Model Training
 
-To train the new dual-head salient segmentation model, use the dedicated `train_salient.py` script. The CLI arguments are fully compatible with `train.py` but customized for binary targets:
+To train the new dual-head salient segmentation model, run `train.py` with the `--model fast_scnn_salient` argument:
 
 ```bash
 # Train on your custom dataset (data/) with custom 16:9 aspect ratio (e.g. 540x960)
-python train_salient.py --profile project --data-root data --train-height 540 --train-width 960 --val-height 540 --val-width 960
+python train.py --model fast_scnn_salient --profile project --data-root data --train-height 540 --train-width 960 --val-height 540 --val-width 960
 
 # Train on the DUTS dataset (requires --allow-threshold)
-python train_salient.py --profile project --data-root duts_data --allow-threshold
+python train.py --model fast_scnn_salient --profile project --data-root duts_data --allow-threshold
 
 # Transfer Learning: Fine-tune using pre-trained weights
-python train_salient.py --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt
+python train.py --model fast_scnn_salient --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt
 
 # Transfer Learning: Freeze the backbone (Feature Extraction)
-python train_salient.py --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt --freeze-backbone
+python train.py --model fast_scnn_salient --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt --freeze-backbone
 
 # Run a quick synthetic data smoke test
-python train_salient.py --smoke-test
+python train.py --model fast_scnn_salient --smoke-test
 ```
 
 ### Salient Model Test & Benchmark

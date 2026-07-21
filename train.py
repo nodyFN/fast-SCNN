@@ -44,9 +44,9 @@ from dataset import (
     build_train_transform,
     build_val_transform,
 )
-from models.fast_scnn import FastSCNN, count_parameters
+from models import FastSCNN, FastSCNNSalient, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
-from utils.losses import CombinedSegmentationLoss, compute_total_loss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss
 from utils.metrics import SegmentationMetrics
 from utils.scheduler import build_scheduler
 from utils.seed import seed_everything
@@ -134,7 +134,7 @@ def build_optimizer(
 def train_one_epoch(
     model: nn.Module,
     dataloader,
-    criterion: CombinedSegmentationLoss,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     scaler: Optional[torch.amp.GradScaler],
@@ -147,8 +147,7 @@ def train_one_epoch(
 ) -> tuple:
     """Run one training epoch. Returns (loss_dict, updated_global_step)."""
     model.train()
-    running = {"total": 0.0, "ce": 0.0, "dice": 0.0, "focal": 0.0,
-               "aux_downsample": 0.0, "aux_global": 0.0}
+    running = {}
     num_batches = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
@@ -160,13 +159,25 @@ def train_one_epoch(
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             output = model(images)
-            losses = compute_total_loss(
-                criterion, output, masks,
-                aux_downsample_weight=cfg.aux_downsample_weight,
-                aux_global_weight=cfg.aux_global_weight,
-            )
+            if cfg.model == "fast_scnn_salient":
+                targets = masks.unsqueeze(1).float()
+                losses = criterion(
+                    coarse_logits=output["coarse_logits"],
+                    fine_logits=output["fine_logits"],
+                    targets=targets,
+                )
+            else:
+                losses = compute_total_loss(
+                    criterion, output, masks,
+                    aux_downsample_weight=cfg.aux_downsample_weight,
+                    aux_global_weight=cfg.aux_global_weight,
+                )
 
         total_loss = losses["total"]
+
+        # Dynamic running loss dictionary creation
+        if not running:
+            running = {k: 0.0 for k in losses.keys()}
 
         # NaN / Inf check
         if not torch.isfinite(total_loss):
@@ -211,9 +222,10 @@ def train_one_epoch(
 def validate(
     model: nn.Module,
     dataloader,
-    criterion: CombinedSegmentationLoss,
+    criterion: nn.Module,
     device: torch.device,
     metrics: SegmentationMetrics,
+    cfg: Config,
     use_amp: bool = False,
 ) -> Dict[str, float]:
     """Run validation. Returns loss + metric dict."""
@@ -227,16 +239,26 @@ def validate(
         masks = batch["mask"].to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(images)  # eval mode → single tensor
-            loss_dict = compute_total_loss(
-                criterion, logits, masks,
-                aux_downsample_weight=0.0,
-                aux_global_weight=0.0,
-            )
+            output = model(images)
+            if cfg.model == "fast_scnn_salient":
+                targets = masks.unsqueeze(1).float()
+                losses = criterion(
+                    coarse_logits=output["coarse_logits"],
+                    fine_logits=output["fine_logits"],
+                    targets=targets,
+                )
+                preds = (output["fine_logits"] > 0.0).squeeze(1).long()
+            else:
+                losses = compute_total_loss(
+                    criterion, output, masks,
+                    aux_downsample_weight=0.0,
+                    aux_global_weight=0.0,
+                )
+                preds = output
 
-        running_loss += loss_dict["total"].item()
+        running_loss += losses["total"].item()
         num_batches += 1
-        metrics.update(logits, masks)
+        metrics.update(preds, masks)
 
     avg_loss = running_loss / max(num_batches, 1)
     metric_results = metrics.compute()
@@ -255,7 +277,15 @@ def run_smoke_test(cfg: Config) -> None:
     device = cfg.resolve_device()
     cfg.ensure_dirs()
 
-    model = FastSCNN(num_classes=cfg.num_classes, aux=cfg.aux, dropout_p=cfg.dropout_p).to(device)
+    if cfg.model == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(num_classes=cfg.num_classes, aux=cfg.aux, dropout_p=cfg.dropout_p).to(device)
     optimizer = build_optimizer(model, cfg)
 
     total_iters = 2 * 2  # 2 epochs × 2 batches
@@ -264,12 +294,29 @@ def run_smoke_test(cfg: Config) -> None:
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device=device.type) if use_amp else None
 
-    criterion = CombinedSegmentationLoss(
-        ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
-        focal_weight=cfg.focal_weight, ignore_index=cfg.ignore_index,
-    )
+    if cfg.model == "fast_scnn_salient":
+        criterion = SalientSegmentationLoss(
+            lambda_coarse=cfg.salient_lambda_coarse,
+            lambda_fine=cfg.salient_lambda_fine,
+            lambda_boundary=cfg.salient_lambda_boundary,
+            coarse_bce_weight=cfg.salient_coarse_bce_weight,
+            coarse_dice_weight=cfg.salient_coarse_dice_weight,
+            fine_focal_weight=cfg.salient_fine_focal_weight,
+            fine_dice_weight=cfg.salient_fine_dice_weight,
+            focal_alpha=cfg.salient_focal_alpha,
+            focal_gamma=cfg.salient_focal_gamma,
+            pos_weight=cfg.salient_pos_weight,
+        )
+    else:
+        criterion = CombinedSegmentationLoss(
+            ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
+            focal_weight=cfg.focal_weight, ignore_index=cfg.ignore_index,
+        )
 
-    metrics_obj = SegmentationMetrics(num_classes=cfg.num_classes, ignore_index=cfg.ignore_index)
+    metrics_obj = SegmentationMetrics(
+        num_classes=2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+        ignore_index=cfg.ignore_index
+    )
 
     h, w = 64, 128  # Small resolution for speed
     bs = 2
@@ -279,13 +326,24 @@ def run_smoke_test(cfg: Config) -> None:
         model.train()
         for _ in range(2):
             images = torch.randn(bs, 3, h, w, device=device)
-            masks = torch.randint(0, cfg.num_classes, (bs, h, w), device=device)
+            masks = torch.randint(
+                0, 2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+                (bs, h, w), device=device
+            )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 output = model(images)
-                losses = compute_total_loss(criterion, output, masks,
-                                            cfg.aux_downsample_weight, cfg.aux_global_weight)
+                if cfg.model == "fast_scnn_salient":
+                    targets = masks.unsqueeze(1).float()
+                    losses = criterion(
+                        coarse_logits=output["coarse_logits"],
+                        fine_logits=output["fine_logits"],
+                        targets=targets,
+                    )
+                else:
+                    losses = compute_total_loss(criterion, output, masks,
+                                                cfg.aux_downsample_weight, cfg.aux_global_weight)
             loss = losses["total"]
             if scaler:
                 scaler.scale(loss).backward()
@@ -303,11 +361,18 @@ def run_smoke_test(cfg: Config) -> None:
         metrics_obj.reset()
         with torch.inference_mode():
             images = torch.randn(bs, 3, h, w, device=device)
-            masks = torch.randint(0, cfg.num_classes, (bs, h, w), device=device)
-            logits = model(images)
-            metrics_obj.update(logits, masks)
-        m = metrics_obj.compute()
-        logger.info(f"  Smoke val mIoU={m['miou']:.4f}")
+            masks = torch.randint(
+                0, 2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+                (bs, h, w), device=device
+            )
+            output = model(images)
+            if cfg.model == "fast_scnn_salient":
+                preds = (output["fine_logits"] > 0.0).squeeze(1).long()
+            else:
+                preds = output
+            metrics_obj.update(preds, masks)
+        res = metrics_obj.compute()
+        logger.info(f"  Smoke val mIoU={res['miou']:.4f}")
 
         if cfg.scheduler.lower() == "cosine":
             scheduler.step()
@@ -366,10 +431,18 @@ def train(cfg: Config) -> None:
     )
 
     # Model
-    model = FastSCNN(
-        num_classes=cfg.num_classes, aux=cfg.aux,
-        ppm_pool_sizes=cfg.ppm_pool_sizes, dropout_p=cfg.dropout_p,
-    ).to(device)
+    if cfg.model == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(
+            num_classes=cfg.num_classes, aux=cfg.aux,
+            ppm_pool_sizes=cfg.ppm_pool_sizes, dropout_p=cfg.dropout_p,
+        ).to(device)
     total_p, trainable_p = count_parameters(model)
     logger.info(f"Parameters: total={total_p:,}  trainable={trainable_p:,}")
 
@@ -380,10 +453,16 @@ def train(cfg: Config) -> None:
 
     # Freeze backbone if requested (Feature Extraction Mode)
     if getattr(cfg, "freeze_backbone", False):
-        for param in model.learning_to_downsample.parameters():
-            param.requires_grad = False
-        for param in model.global_feature_extractor.parameters():
-            param.requires_grad = False
+        if cfg.model == "fast_scnn_salient":
+            for param in model.backbone.learning_to_downsample.parameters():
+                param.requires_grad = False
+            for param in model.backbone.global_feature_extractor.parameters():
+                param.requires_grad = False
+        else:
+            for param in model.learning_to_downsample.parameters():
+                param.requires_grad = False
+            for param in model.global_feature_extractor.parameters():
+                param.requires_grad = False
         logger.info("Backbone modules (LearningToDownsample & GlobalFeatureExtractor) have been FROZEN.")
         # Recalculate parameters
         total_p, trainable_p = count_parameters(model)
@@ -400,15 +479,32 @@ def train(cfg: Config) -> None:
     scaler = torch.amp.GradScaler(device=device.type) if use_amp else None
 
     # Loss
-    criterion = CombinedSegmentationLoss(
-        ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
-        focal_weight=cfg.focal_weight, focal_alpha=cfg.focal_alpha,
-        focal_gamma=cfg.focal_gamma, class_weights=cfg.class_weights,
-        ignore_index=cfg.ignore_index,
-    )
+    if cfg.model == "fast_scnn_salient":
+        criterion = SalientSegmentationLoss(
+            lambda_coarse=cfg.salient_lambda_coarse,
+            lambda_fine=cfg.salient_lambda_fine,
+            lambda_boundary=cfg.salient_lambda_boundary,
+            coarse_bce_weight=cfg.salient_coarse_bce_weight,
+            coarse_dice_weight=cfg.salient_coarse_dice_weight,
+            fine_focal_weight=cfg.salient_fine_focal_weight,
+            fine_dice_weight=cfg.salient_fine_dice_weight,
+            focal_alpha=cfg.salient_focal_alpha,
+            focal_gamma=cfg.salient_focal_gamma,
+            pos_weight=cfg.salient_pos_weight,
+        )
+    else:
+        criterion = CombinedSegmentationLoss(
+            ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
+            focal_weight=cfg.focal_weight, focal_alpha=cfg.focal_alpha,
+            focal_gamma=cfg.focal_gamma, class_weights=cfg.class_weights,
+            ignore_index=cfg.ignore_index,
+        )
 
     # Metrics
-    metrics_obj = SegmentationMetrics(cfg.num_classes, cfg.ignore_index)
+    metrics_obj = SegmentationMetrics(
+        2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+        cfg.ignore_index
+    )
 
     # TensorBoard
     writer = SummaryWriter(log_dir=str(cfg.tensorboard_dir))
@@ -454,28 +550,45 @@ def train(cfg: Config) -> None:
                 scheduler.step()
 
             # Validate
-            val_results = validate(model, val_loader, criterion, device, metrics_obj, use_amp)
+            val_results = validate(model, val_loader, criterion, device, metrics_obj, cfg, use_amp)
 
             elapsed = time.time() - t0
             current_lr = optimizer.param_groups[0]["lr"]
 
             # Log
-            logger.info(
-                f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
-                f"Train loss={train_losses['total']:.4f} (CE={train_losses['ce']:.4f} "
-                f"Dice={train_losses['dice']:.4f} "
-                f"aux_ds={train_losses['aux_downsample']:.4f} "
-                f"aux_gl={train_losses['aux_global']:.4f}) | "
-                f"Val loss={val_results['val_loss']:.4f} | "
-                f"PA={val_results['pixel_accuracy']:.4f} "
-                f"mIoU={val_results['miou']:.4f} "
-                f"FG_IoU={val_results['foreground_iou']:.4f} "
-                f"FG_Dice={val_results['foreground_dice']:.4f} | "
-                f"LR={current_lr:.6f} | Best mIoU={best_miou:.4f}"
-            )
-            for i, name in enumerate(cfg.class_names):
-                logger.info(f"  {name}: IoU={val_results['per_class_iou'][i]:.4f}  "
-                            f"Dice={val_results['per_class_dice'][i]:.4f}")
+            if cfg.model == "fast_scnn_salient":
+                logger.info(
+                    f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
+                    f"Train loss={train_losses['total']:.4f} (Coarse={train_losses['coarse']:.4f} "
+                    f"Fine={train_losses['fine']:.4f} "
+                    f"Boundary={train_losses['boundary']:.4f}) | "
+                    f"Val loss={val_results['val_loss']:.4f} | "
+                    f"PA={val_results['pixel_accuracy']:.4f} "
+                    f"mIoU={val_results['miou']:.4f} "
+                    f"FG_IoU={val_results['foreground_iou']:.4f} "
+                    f"FG_Dice={val_results['foreground_dice']:.4f} | "
+                    f"LR={current_lr:.6f} | Best mIoU={best_miou:.4f}"
+                )
+                for i, name in enumerate(["background", "foreground"]):
+                    logger.info(f"  {name}: IoU={val_results['per_class_iou'][i]:.4f}  "
+                                f"Dice={val_results['per_class_dice'][i]:.4f}")
+            else:
+                logger.info(
+                    f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
+                    f"Train loss={train_losses['total']:.4f} (CE={train_losses['ce']:.4f} "
+                    f"Dice={train_losses['dice']:.4f} "
+                    f"aux_ds={train_losses['aux_downsample']:.4f} "
+                    f"aux_gl={train_losses['aux_global']:.4f}) | "
+                    f"Val loss={val_results['val_loss']:.4f} | "
+                    f"PA={val_results['pixel_accuracy']:.4f} "
+                    f"mIoU={val_results['miou']:.4f} "
+                    f"FG_IoU={val_results['foreground_iou']:.4f} "
+                    f"FG_Dice={val_results['foreground_dice']:.4f} | "
+                    f"LR={current_lr:.6f} | Best mIoU={best_miou:.4f}"
+                )
+                for i, name in enumerate(cfg.class_names):
+                    logger.info(f"  {name}: IoU={val_results['per_class_iou'][i]:.4f}  "
+                                f"Dice={val_results['per_class_dice'][i]:.4f}")
 
             # History
             history["train_loss"].append(train_losses["total"])
@@ -489,8 +602,13 @@ def train(cfg: Config) -> None:
             # TensorBoard
             writer.add_scalar("Loss/train", train_losses["total"], epoch)
             writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
-            writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
-            writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
+            if cfg.model == "fast_scnn_salient":
+                writer.add_scalar("Loss/coarse", train_losses["coarse"], epoch)
+                writer.add_scalar("Loss/fine", train_losses["fine"], epoch)
+                writer.add_scalar("Loss/boundary", train_losses["boundary"], epoch)
+            else:
+                writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
+                writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
             writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
             writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
             writer.add_scalar("Metrics/foreground_iou", val_results["foreground_iou"], epoch)
@@ -506,9 +624,13 @@ def train(cfg: Config) -> None:
                     msks = sample_batch["mask"].to(device)
                     with torch.inference_mode():
                         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                            preds_logits = model(imgs)
-                    preds = preds_logits.argmax(dim=1)
-                    probs = torch.softmax(preds_logits, dim=1)[:, 1]
+                            preds_outputs = model(imgs)
+                    if cfg.model == "fast_scnn_salient":
+                        preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
+                        probs = preds_outputs["fine_prob"].squeeze(1)
+                    else:
+                        preds = preds_outputs.argmax(dim=1)
+                        probs = torch.softmax(preds_outputs, dim=1)[:, 1]
                     visualize_segmentation(
                         imgs, msks, preds, probs,
                         save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
@@ -573,6 +695,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Fast-SCNN")
     p.add_argument("--profile", choices=["paper", "project"], default=None,
                    help="Training profile (default: use config.py defaults)")
+    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default=None,
+                   help="Model architecture to train (default: fast_scnn)")
     p.add_argument("--data-root", type=str, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
@@ -614,6 +738,8 @@ def main() -> None:
         cfg = Config()
 
     # CLI overrides
+    if args.model:
+        cfg.model = args.model
     if args.data_root:
         cfg.data_root = Path(args.data_root)
         cfg.train_dir = cfg.data_root / "train"
