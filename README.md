@@ -392,7 +392,7 @@ python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input imag
 # Folder of images
 python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input data/test/images/ --output-dir results/
 ```
-Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), and `_overlay.jpg` (colour blend) for each image. It logs model-only latency and end-to-end latency separately.
+Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), `_prob_gray.png` (grayscale probability mask [0, 255]), and `_overlay.jpg` (colour blend) for each image. It logs model-only latency and end-to-end latency separately.
 
 ---
 

@@ -166,10 +166,11 @@ def infer_single(
     cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
     cv2.imwrite(str(output_dir / f"{stem}_overlay.jpg"), overlay)
 
-    # Probability map as heatmap
+    # Probability map as heatmap & grayscale
     prob_vis = (results["fg_probability"] * 255).astype(np.uint8)
     prob_color = cv2.applyColorMap(prob_vis, cv2.COLORMAP_JET)
     cv2.imwrite(str(output_dir / f"{stem}_prob.jpg"), prob_color)
+    cv2.imwrite(str(output_dir / f"{stem}_prob_gray.png"), prob_vis)
 
     return timings
 
