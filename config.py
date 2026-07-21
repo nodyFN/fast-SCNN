@@ -134,6 +134,21 @@ class Config:
     aug_scale_min: float = 0.5  # Paper: 0.5
     aug_scale_max: float = 2.0  # Paper: 2.0
 
+    # ── Salient Dual-Head Model ──────────────────────────────────────
+    coarse_channels: int = 64
+    refinement_channels: int = 64
+    salient_coarse_bce_weight: float = 1.0
+    salient_coarse_dice_weight: float = 1.0
+    salient_fine_focal_weight: float = 1.0
+    salient_fine_dice_weight: float = 1.0
+    salient_boundary_weight: float = 1.0
+    salient_lambda_coarse: float = 1.0
+    salient_lambda_fine: float = 1.0
+    salient_lambda_boundary: float = 0.5
+    salient_focal_alpha: float = 0.25
+    salient_focal_gamma: float = 2.0
+    salient_pos_weight: Optional[float] = None
+
     def resolve_device(self) -> torch.device:
         """Return the torch.device to use."""
         if self.device == "auto":

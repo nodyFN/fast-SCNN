@@ -522,6 +522,23 @@ class FastSCNN(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the fused feature map without applying the classifier.
+
+        This is used by downstream models (e.g. FastSCNNSalient) that share
+        the backbone but attach their own heads.
+
+        Returns
+        -------
+        fused : Tensor  [B, 128, H/8, W/8]
+            Feature-fusion output at ~1/8 input resolution.
+        """
+        ltd_out = self.learning_to_downsample(x)
+        gfe_out = self.global_feature_extractor(ltd_out)
+        ppm_out = self.ppm(gfe_out)
+        fused = self.ffm(high_res=ltd_out, low_res=ppm_out)
+        return fused
+
     def forward(
         self, x: torch.Tensor
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:

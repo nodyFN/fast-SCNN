@@ -301,3 +301,308 @@ def compute_total_loss(
         "aux_downsample": aux_ds_loss,
         "aux_global": aux_gl_loss,
     }
+
+
+# ===========================================================================
+# Binary losses for FastSCNNSalient (1-channel logits)
+# ===========================================================================
+
+
+class BinaryDiceLoss(nn.Module):
+    """Binary Dice Loss using sigmoid probabilities.
+
+    Computes batch-wise Dice coefficient on 1-channel predictions.
+
+    Parameters
+    ----------
+    smooth : float
+        Smoothing constant to avoid division by zero (default 1.0).
+    """
+
+    def __init__(self, smooth: float = 1.0) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits : [B, 1, H, W]  raw logits
+        targets : [B, 1, H, W]  float (0.0 or 1.0)
+        """
+        probs = torch.sigmoid(logits)
+
+        # Flatten spatial dimensions: [B, N]
+        probs_flat = probs.view(probs.size(0), -1)
+        targets_flat = targets.view(targets.size(0), -1).float()
+
+        intersection = (probs_flat * targets_flat).sum(dim=1)
+        pred_sum = probs_flat.sum(dim=1)
+        target_sum = targets_flat.sum(dim=1)
+
+        dice = (2.0 * intersection + self.smooth) / (
+            pred_sum + target_sum + self.smooth
+        )
+
+        return 1.0 - dice.mean()
+
+
+class BinaryFocalLoss(nn.Module):
+    """Binary Focal Loss using numerically stable logits formulation.
+
+    Uses ``F.binary_cross_entropy_with_logits`` internally.
+
+    Parameters
+    ----------
+    alpha : float
+        Balancing factor (default 0.25).
+    gamma : float
+        Focusing parameter (default 2.0).
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits : [B, 1, H, W]  raw logits
+        targets : [B, 1, H, W]  float (0.0 or 1.0)
+        """
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets.float(), reduction="none",
+        )
+
+        prob = torch.sigmoid(logits)
+
+        # p_t = prob if target=1, (1-prob) if target=0
+        p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+
+        # alpha_t = alpha if target=1, (1-alpha) if target=0
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+
+        focal = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
+
+        return focal.mean()
+
+
+class SobelBoundaryLoss(nn.Module):
+    """Boundary loss using fixed Sobel edge detection kernels.
+
+    Computes edge magnitude for both prediction and ground truth using
+    Sobel operators, then minimizes L1 distance between them.
+
+    Sobel kernels are registered as buffers (non-trainable, device-following).
+
+    Parameters
+    ----------
+    eps : float
+        Small epsilon for numerical stability in sqrt (default 1e-6).
+    """
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+        # Sobel X kernel [1, 1, 3, 3]
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0],
+             [-2.0, 0.0, 2.0],
+             [-1.0, 0.0, 1.0]],
+        ).unsqueeze(0).unsqueeze(0)
+
+        # Sobel Y kernel [1, 1, 3, 3]
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0],
+             [ 0.0,  0.0,  0.0],
+             [ 1.0,  2.0,  1.0]],
+        ).unsqueeze(0).unsqueeze(0)
+
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def _edge_magnitude(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute edge magnitude from [B, 1, H, W] input."""
+        edge_x = F.conv2d(x, self.sobel_x, padding=1)
+        edge_y = F.conv2d(x, self.sobel_y, padding=1)
+        return torch.sqrt(edge_x.square() + edge_y.square() + self.eps)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits : [B, 1, H, W]  fine logits (gradients flow through sigmoid)
+        targets : [B, 1, H, W]  float (0.0 or 1.0)
+        """
+        fine_prob = torch.sigmoid(logits)
+
+        pred_edge = self._edge_magnitude(fine_prob)
+        gt_edge = self._edge_magnitude(targets.float())
+
+        return F.l1_loss(pred_edge, gt_edge)
+
+
+class SalientSegmentationLoss(nn.Module):
+    """Combined loss for FastSCNNSalient.
+
+    Total loss::
+
+        L_total = lambda_coarse  * L_coarse
+                + lambda_fine    * L_fine
+                + lambda_boundary * L_boundary
+
+    Where::
+
+        L_coarse   = bce_weight * BCEWithLogits + dice_weight * BinaryDice
+        L_fine     = focal_weight * BinaryFocal + dice_weight * BinaryDice
+        L_boundary = SobelBoundaryLoss (on fine prediction only)
+
+    Parameters
+    ----------
+    lambda_coarse : float
+        Weight for coarse loss (default 1.0).
+    lambda_fine : float
+        Weight for fine loss (default 1.0).
+    lambda_boundary : float
+        Weight for boundary loss (default 0.5).
+    coarse_bce_weight : float
+        Weight for BCE in coarse loss (default 1.0).
+    coarse_dice_weight : float
+        Weight for Dice in coarse loss (default 1.0).
+    fine_focal_weight : float
+        Weight for Focal in fine loss (default 1.0).
+    fine_dice_weight : float
+        Weight for Dice in fine loss (default 1.0).
+    focal_alpha : float
+        Alpha for BinaryFocalLoss (default 0.25).
+    focal_gamma : float
+        Gamma for BinaryFocalLoss (default 2.0).
+    pos_weight : float or None
+        Positive class weight for BCEWithLogitsLoss (default None).
+    """
+
+    def __init__(
+        self,
+        lambda_coarse: float = 1.0,
+        lambda_fine: float = 1.0,
+        lambda_boundary: float = 0.5,
+        coarse_bce_weight: float = 1.0,
+        coarse_dice_weight: float = 1.0,
+        fine_focal_weight: float = 1.0,
+        fine_dice_weight: float = 1.0,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        pos_weight: Optional[float] = None,
+    ) -> None:
+        super().__init__()
+        self.lambda_coarse = lambda_coarse
+        self.lambda_fine = lambda_fine
+        self.lambda_boundary = lambda_boundary
+
+        self.coarse_bce_w = coarse_bce_weight
+        self.coarse_dice_w = coarse_dice_weight
+        self.fine_focal_w = fine_focal_weight
+        self.fine_dice_w = fine_dice_weight
+
+        # pos_weight for BCEWithLogitsLoss
+        self.register_buffer(
+            "pos_weight",
+            torch.tensor([pos_weight], dtype=torch.float32)
+            if pos_weight is not None
+            else None,
+        )
+
+        # Loss components
+        self.binary_dice = BinaryDiceLoss()
+        self.binary_focal = BinaryFocalLoss(
+            alpha=focal_alpha, gamma=focal_gamma,
+        )
+        self.boundary = SobelBoundaryLoss()
+
+    def forward(
+        self,
+        coarse_logits: torch.Tensor,
+        fine_logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        coarse_logits : [B, 1, H, W]
+        fine_logits : [B, 1, H, W]
+        targets : [B, 1, H, W]  float (0.0 or 1.0)
+
+        Returns
+        -------
+        dict with keys:
+            total, coarse, fine, boundary,
+            coarse_bce, coarse_dice, fine_focal, fine_dice
+        """
+        targets_float = targets.float()
+        zero = torch.tensor(0.0, device=coarse_logits.device)
+
+        # ── Coarse Loss: BCEWithLogits + BinaryDice ───────────────────
+        pw = self.pos_weight
+        if pw is not None:
+            pw = pw.to(coarse_logits.device)
+
+        coarse_bce = (
+            F.binary_cross_entropy_with_logits(
+                coarse_logits, targets_float, pos_weight=pw,
+            )
+            if self.coarse_bce_w > 0
+            else zero
+        )
+        coarse_dice = (
+            self.binary_dice(coarse_logits, targets_float)
+            if self.coarse_dice_w > 0
+            else zero
+        )
+        coarse_loss = (
+            self.coarse_bce_w * coarse_bce
+            + self.coarse_dice_w * coarse_dice
+        )
+
+        # ── Fine Loss: BinaryFocal + BinaryDice ──────────────────────
+        fine_focal = (
+            self.binary_focal(fine_logits, targets_float)
+            if self.fine_focal_w > 0
+            else zero
+        )
+        fine_dice = (
+            self.binary_dice(fine_logits, targets_float)
+            if self.fine_dice_w > 0
+            else zero
+        )
+        fine_loss = (
+            self.fine_focal_w * fine_focal
+            + self.fine_dice_w * fine_dice
+        )
+
+        # ── Boundary Loss: Sobel on fine prediction only ──────────────
+        boundary_loss = (
+            self.boundary(fine_logits, targets_float)
+            if self.lambda_boundary > 0
+            else zero
+        )
+
+        # ── Total ─────────────────────────────────────────────────────
+        total = (
+            self.lambda_coarse * coarse_loss
+            + self.lambda_fine * fine_loss
+            + self.lambda_boundary * boundary_loss
+        )
+
+        return {
+            "total": total,
+            "coarse": coarse_loss,
+            "fine": fine_loss,
+            "boundary": boundary_loss,
+            "coarse_bce": coarse_bce,
+            "coarse_dice": coarse_dice,
+            "fine_focal": fine_focal,
+            "fine_dice": fine_dice,
+        }
