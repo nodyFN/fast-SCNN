@@ -211,7 +211,8 @@ fast-SCNN/
 ├── README.md
 ├── config.py             # Centralized configuration
 ├── dataset.py            # Dataset + transforms + DataLoader
-├── train.py              # Training script
+├── train.py              # Original Fast-SCNN training script
+├── train_salient.py      # Salient dual-head model training script
 ├── evaluate.py           # Evaluation script
 ├── inference.py          # Single/folder inference
 ├── export.py             # ONNX export + validation
@@ -542,6 +543,27 @@ All salient model parameters are configurable in `config.py`:
 | `salient_focal_alpha` | 0.25 | Focal Loss alpha |
 | `salient_focal_gamma` | 2.0 | Focal Loss gamma |
 | `salient_pos_weight` | None | BCEWithLogitsLoss pos_weight |
+
+### Salient Model Training
+
+To train the new dual-head salient segmentation model, use the dedicated `train_salient.py` script. The CLI arguments are fully compatible with `train.py` but customized for binary targets:
+
+```bash
+# Train on your custom dataset (data/) with custom 16:9 aspect ratio (e.g. 540x960)
+python train_salient.py --profile project --data-root data --train-height 540 --train-width 960 --val-height 540 --val-width 960
+
+# Train on the DUTS dataset (requires --allow-threshold)
+python train_salient.py --profile project --data-root duts_data --allow-threshold
+
+# Transfer Learning: Fine-tune using pre-trained weights
+python train_salient.py --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt
+
+# Transfer Learning: Freeze the backbone (Feature Extraction)
+python train_salient.py --profile project --data-root data --weights checkpoints/TIMESTAMP/best_miou.pt --freeze-backbone
+
+# Run a quick synthetic data smoke test
+python train_salient.py --smoke-test
+```
 
 ### Salient Model Test & Benchmark
 
