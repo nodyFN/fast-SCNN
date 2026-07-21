@@ -491,14 +491,14 @@ def train(cfg: Config) -> None:
             focal_alpha=cfg.salient_focal_alpha,
             focal_gamma=cfg.salient_focal_gamma,
             pos_weight=cfg.salient_pos_weight,
-        )
+        ).to(device)
     else:
         criterion = CombinedSegmentationLoss(
             ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
             focal_weight=cfg.focal_weight, focal_alpha=cfg.focal_alpha,
             focal_gamma=cfg.focal_gamma, class_weights=cfg.class_weights,
             ignore_index=cfg.ignore_index,
-        )
+        ).to(device)
 
     # Metrics
     metrics_obj = SegmentationMetrics(
