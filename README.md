@@ -10,8 +10,15 @@ A complete PyTorch implementation of [Fast-SCNN](https://arxiv.org/abs/1902.0450
 - [Project vs Paper Settings](#project-vs-paper-settings)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
-- [Dataset Format](#dataset-format)
+- [Dataset Formats](#dataset-formats)
+  - [Custom Dataset (`data/`)](#1-custom-dataset-data)
+  - [DUTS Dataset (`duts_data/`)](#2-duts-dataset-duts_data)
 - [Training](#training)
+  - [Standard Training](#standard-training)
+  - [Focal Loss Tuning](#focal-loss-tuning)
+  - [Transfer Learning (轉移學習 / 微調)](#transfer-learning-轉移學習--微調)
+  - [Resuming Training](#resuming-training)
+  - [Smoke Test](#smoke-test)
 - [Evaluation](#evaluation)
 - [Inference](#inference)
 - [ONNX Export](#onnx-export)
@@ -192,7 +199,9 @@ Use `--profile paper` or `--profile project` to switch between profiles.
 
 ```
 fast-SCNN/
-├── Pipfile               # Python 3.10.2 + dependencies
+├── .gitignore
+├── Pipfile               # Dependencies (CPU-default)
+├── requirements.txt      # Versionless dependencies (Linux headless server friendly)
 ├── README.md
 ├── config.py             # Centralized configuration
 ├── dataset.py            # Dataset + transforms + DataLoader
@@ -200,6 +209,9 @@ fast-SCNN/
 ├── evaluate.py           # Evaluation script
 ├── inference.py          # Single/folder inference
 ├── export.py             # ONNX export + validation
+├── prepare_my_dataset.py # Custom dataset fusion/splitter
+├── prepare_duts_dataset.py # DUTS dataset splitter
+├── check_mask_value.py   # Utility to inspect mask pixel values
 ├── models/
 │   ├── __init__.py
 │   └── fast_scnn.py      # Complete Fast-SCNN implementation
@@ -212,14 +224,19 @@ fast-SCNN/
 │   ├── visualization.py  # Training curves + segmentation vis
 │   └── seed.py           # Reproducibility
 ├── tests/
+│   ├── __init__.py
 │   ├── test_model.py
 │   ├── test_dataset.py
 │   └── test_metrics.py
-├── checkpoints/          # Saved model checkpoints
-├── training_results/     # Training curve plots
-├── runs/                 # TensorBoard logs
-└── exports/              # ONNX models
+├── checkpoints/          # Saved model checkpoints (Subdivided by timestamp)
+├── training_results/     # Training curve plots & visualisations (Subdivided by timestamp)
+├── runs/                 # TensorBoard logs (Subdivided by timestamp)
+├── exports/              # ONNX models
+├── data/                 # Custom Dataset Directory (Git-ignored skeleton)
+└── duts_data/            # DUTS Dataset Directory (Git-ignored skeleton)
 ```
+
+*Note: Output files in `checkpoints/`, `training_results/`, and `runs/` are organized inside subdirectories named after the training run's timestamp (e.g. `20260720_145440`) to keep experiments separated.*
 
 ---
 
@@ -243,100 +260,101 @@ pipenv install --dev
 pipenv shell
 ```
 
-### CPU-only PyTorch
-
-The default `Pipfile` installs CPU PyTorch from PyPI. This works out of the box:
+### Headless Linux Server / Versionless Installation
+If installing on a headless Linux server with Python 3.10.2, use the versionless `requirements.txt`. It defaults to `opencv-python-headless` to avoid missing X11/GUI system library dependencies:
 
 ```bash
-pipenv install --dev
+pip install -r requirements.txt
 ```
 
-### CUDA PyTorch
-
-For NVIDIA GPU support, install the CUDA version of PyTorch manually:
+### CUDA / GPU PyTorch
+For NVIDIA GPU support, install the CUDA version of PyTorch first, then install the rest of the packages:
 
 ```bash
-# Activate pipenv shell first
-pipenv shell
-
-# Install CUDA 12.1 PyTorch (adjust URL for your CUDA version)
+# For CUDA 12.1:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 
-# Or CUDA 11.8
+# For CUDA 11.8:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
 ```
 
-Verify:
+Verify GPU availability:
 ```bash
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 ```
 
 ---
 
-## Dataset Format
+## Dataset Formats
 
+All datasets must structure images and masks symmetrically by file stem (e.g., `images/img_001.jpg` ↔ `masks/img_001.png`). Masks must be single-channel `.png` files.
+
+### 1. Custom Dataset (`data/`)
+For segmenting custom foreground objects against background. Has folders:
 ```
 data/
 ├── train/
-│   ├── images/    (*.jpg, *.jpeg, *.png)
-│   └── masks/     (*.png, single-channel)
-├── val/
 │   ├── images/
-│   └── masks/
+│   └── masks/ (Values: 0 for background, 255/1 for foreground)
+├── val/
+│   └── ...
 └── test/
-    ├── images/
-    └── masks/
+    └── ...
 ```
+If you have raw `FG` (foreground) and `NO_FG` (no foreground) images in a `my_dataset` folder, you can merge and split them into `data/` using:
+```bash
+python prepare_my_dataset.py --src /path/to/my_dataset
+```
+*This handles file name collisions by prefixing stems with `fg_` or `nofg_` and splits 8:1:1.*
 
-**Pairing**: Image and mask match by file stem (e.g. `images/frame_0001.jpg` ↔ `masks/frame_0001.png`).
-
-### Mask format
-
-- Values `{0, 1}`: used directly (0 = background, 1 = foreground)
-- Values `{0, 255}`: automatically converted (255 → 1)
-- Other values: **raises error** by default. Set `allow_threshold=True` to threshold at 127.
+### 2. DUTS Dataset (`duts_data/`)
+For general salient object detection. Download the DUTS dataset folder containing `DUTS-TR` and `DUTS-TE` and execute the splitter script:
+```bash
+python prepare_duts_dataset.py --src /path/to/DUTS
+```
+*This splits `DUTS-TR` (95% to `duts_data/train/`, 5% to `duts_data/val/`) and sends `DUTS-TE` directly to `duts_data/test/`.*
 
 ---
 
 ## Training
 
-### Project profile (recommended for this dataset)
+### Standard Training
+Run standard training by targeting your preferred dataset with the `--data-root` flag:
 
 ```bash
-python train.py --profile project --epochs 200 --batch-size 4
+# Train on your custom dataset (data/)
+python train.py --profile project --data-root data
+
+# Train on the DUTS dataset (duts_data/).
+# NOTE: DUTS masks contain grayscale soft edges, so you MUST add --allow-threshold
+# to binarize them into strict 0/1 target formats.
+python train.py --profile project --data-root duts_data --allow-threshold
 ```
 
-### Paper profile
-
+### Focal Loss Tuning
+You can adjust the weight of Focal Loss in the combined loss function directly from the command line:
 ```bash
-python train.py --profile paper --epochs 1000 --batch-size 12
+python train.py --profile project --data-root data --focal-weight 0.5
 ```
 
-### Resume training
-
+### Transfer Learning (轉移學習 / 微調)
+If you have trained a backbone on DUTS and want to use it as pre-trained weights for your custom dataset:
 ```bash
-python train.py --resume checkpoints/latest.pt
+python train.py --profile project --data-root data --weights checkpoints/DUTS_TIMESTAMP/best_miou.pt
 ```
+*The `--weights` flag performs a **weights-only initialization**. Unlike `--resume`, it starts the epoch counter from 0 and initializes a fresh optimizer and scheduler.*
 
-### Common options
-
+### Resuming Training
+To resume an interrupted training run (restores epoch, steps, optimizer states, and scheduler decay progress exactly):
 ```bash
-python train.py \
-    --profile project \
-    --epochs 100 \
-    --batch-size 8 \
-    --lr 0.001 \
-    --optimizer adamw \
-    --scheduler poly \
-    --train-height 512 \
-    --train-width 1024 \
-    --device auto \
-    --seed 42 \
-    --early-stopping 50
+python train.py --resume checkpoints/TIMESTAMP/latest.pt --epochs 100
 ```
+*Note: Make sure to increase `--epochs` to a value higher than the epoch at which the checkpoint was saved, otherwise it will exit immediately.*
 
-### Smoke test (no real data needed)
-
+### Smoke Test
+Run a quick, dataset-free, GPU-free sanity check to verify the model builds, trains, backward passes, and saves checkpoints:
 ```bash
 python train.py --smoke-test
 ```
@@ -345,110 +363,81 @@ python train.py --smoke-test
 
 ## Evaluation
 
-```bash
-# Evaluate on validation set
-python evaluate.py --checkpoint checkpoints/best_miou.pt --split val
+Evaluate a saved checkpoint against the validation or test split of your dataset:
 
-# Evaluate on test set with visualizations
-python evaluate.py --checkpoint checkpoints/best_miou.pt --split test --save-vis
+```bash
+# Evaluate on custom validation split
+python evaluate.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split val --data-root data
+
+# Evaluate on DUTS test split with visual output (requires --allow-threshold)
+python evaluate.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split test --data-root duts_data --allow-threshold --save-vis
 ```
 
 ---
 
 ## Inference
 
-### Single image
+Run inference on a single image or a folder of images. Preprocessing automatically resizes the image to the model input dimensions, and postprocessing upsamples the prediction mask back to the original image dimensions.
 
 ```bash
-python inference.py --checkpoint checkpoints/best_miou.pt --input image.jpg --output-dir results/
+# Single image
+python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --output-dir results/
+
+# Folder of images
+python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input data/test/images/ --output-dir results/
 ```
-
-### Folder inference
-
-```bash
-python inference.py --checkpoint checkpoints/best_miou.pt --input data/test/images/ --output-dir results/
-```
-
-Outputs per image: `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (heatmap), `_overlay.jpg`.
-
-Timing breakdown reports model-only latency and end-to-end latency separately.
+Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), and `_overlay.jpg` (colour blend) for each image. It logs model-only latency and end-to-end latency separately.
 
 ---
 
 ## ONNX Export
 
 ### Fixed-size export
-
 ```bash
-python export.py --checkpoint checkpoints/best_miou.pt --height 512 --width 1024
+python export.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024
 ```
 
-### Dynamic axes export
-
+### Dynamic axes export (Recommended for varying resolutions)
 ```bash
-python export.py --checkpoint checkpoints/best_miou.pt --height 512 --width 1024 --dynamic
+python export.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024 --dynamic
 ```
 
-### Custom opset
-
-```bash
-python export.py --checkpoint checkpoints/best_miou.pt --opset 17
-```
-
-ONNX Runtime validation runs automatically after export: checks model structure, output shape, and numerical accuracy vs PyTorch. Dynamic exports are tested with multiple input sizes.
-
-### ONNX/TensorRT Deployment Notes
-
-- Default opset 17 provides good compatibility with TensorRT 8.6+
-- `align_corners=False` is used for all bilinear interpolation — verify your TensorRT version handles this correctly
-- Dynamic axes support batch, height, and width dimensions
-- If dynamic spatial dims cause issues with specific TensorRT versions, use fixed-size export
+After export, ONNX Runtime validation runs automatically: checking the model structure, output shape, and numerical deviation vs PyTorch. Dynamic exports are tested at multiple input resolutions.
 
 ---
 
 ## TensorBoard
 
+Visualize loss curves, auxiliary losses, metric scores (PA, mIoU, Foreground IoU, Foreground Dice), and learning rate changes:
+
 ```bash
 tensorboard --logdir runs/
 ```
-
-Logged metrics: `Loss/train`, `Loss/validation`, `Loss/aux_downsample`, `Loss/aux_global`, `Metrics/pixel_accuracy`, `Metrics/miou`, `Metrics/foreground_iou`, `Metrics/foreground_dice`, `LearningRate`.
 
 ---
 
 ## Testing
 
-### Run all tests
+Run unit tests via `pytest` to verify components locally:
 
 ```bash
+# Run all tests
 pytest tests/ -v
-```
 
-### Run specific test file
-
-```bash
+# Run specific modules
 pytest tests/test_model.py -v
 pytest tests/test_dataset.py -v
 pytest tests/test_metrics.py -v
 ```
 
-### Smoke test
-
+### Model latency & FPS Benchmark
+Test Fast-SCNN's pure forward pass latency and average FPS on a dummy tensor of choice:
 ```bash
-python train.py --smoke-test
-```
+# Default resolution (512x1024)
+python models/fast_scnn.py --device cuda
 
-### Model benchmark
-
-```bash
-# Default 512×1024
-python models/fast_scnn.py
-
-# Full resolution 1080×1920
-python models/fast_scnn.py --full-res
-
-# With auxiliary heads
-python models/fast_scnn.py --aux
+# Full TV resolution (1080x1920)
+python models/fast_scnn.py --device cuda --full-res
 ```
 
 ---
@@ -456,48 +445,14 @@ python models/fast_scnn.py --aux
 ## Troubleshooting
 
 ### 1920×1080 Training VRAM Issues
-
-The original 1920×1080 resolution requires significant GPU memory. Recommendations:
-
-- **Reduce crop size**: Default training uses `512×1024` crops (configurable via `--train-height` / `--train-width`)
-- **Reduce batch size**: `--batch-size 2` or even 1
-- **Enable AMP**: `--profile project` enables mixed precision by default
-- Typical VRAM: ~4 GB for batch_size=4 @ 512×1024 with AMP
-
-### Suggested Crop Size / Batch Size
-
-| GPU VRAM | Crop Size | Batch Size |
-|---|---|---|
-| 4 GB | 256×512 | 4 |
-| 8 GB | 512×1024 | 4 |
-| 12 GB | 512×1024 | 8 |
-| 24 GB | 768×1536 | 8-12 |
+The original 1920×1080 resolution is memory-intensive. For optimal VRAM usage:
+- Use smaller crop sizes: default training uses `512×1024` crops (`--train-height 512 --train-width 1024`).
+- Decrease batch size: `--batch-size 2` or `4`.
+- Enable mixed-precision (AMP): `--profile project` turns AMP on by default.
 
 ### BatchNorm + Small Batch Size
-
-- PPM's 1×1 pooling branch produces single-value features, causing BatchNorm instability with batch_size=1
-- **Use batch_size ≥ 2 for training**
-- For batch_size=1 inference, use `model.eval()` (BN uses running statistics)
+- Due to PPM's 1×1 average pooling branch, training with `batch_size=1` causes BatchNorm instability.
+- **Always train with `batch_size ≥ 2`**.
 
 ### Windows `num_workers`
-
-On Windows, `num_workers > 0` requires code to run inside `if __name__ == '__main__':`. Set `--num-workers 0` if you encounter multiprocessing errors.
-
-### Model Latency vs End-to-End Latency
-
-- **Model-only latency**: Pure neural network forward pass time
-- **End-to-end latency**: Includes image loading, preprocessing, inference, and postprocessing
-- These are reported separately in `inference.py`
-- CUDA timing uses `torch.cuda.synchronize()` for accurate measurement
-
-### FPS Measurement
-
-```
-FPS = total_images_processed / total_inference_seconds
-```
-
-Not `iterations_per_second` — each iteration may process a full batch of images.
-
-### Deterministic Mode
-
-Setting `--seed 42` with `deterministic=True` in config enables reproducible training but **may slow down training** due to deterministic CUDA kernel fallbacks. Some CUDA operations may still introduce tiny differences.
+On Windows, `num_workers > 0` requires code to be executed inside `if __name__ == '__main__':`. Set `--num-workers 0` if you encounter multiprocessing errors.
