@@ -346,11 +346,16 @@ def get_project_config() -> Config:
 ```
 
 ### Transfer Learning (轉移學習 / 微調)
-If you have trained a backbone on DUTS and want to use it as pre-trained weights for your custom dataset:
+If you have trained a backbone on DUTS and want to use it as pre-trained weights for your custom dataset, you have two options:
+
 ```bash
+# Option A: Fine-tune the entire network (Recommended)
 python train.py --profile project --data-root data --weights checkpoints/DUTS_TIMESTAMP/best_miou.pt
+
+# Option B: Freeze the backbone and only train classifier/fusion layers (Feature Extraction Mode)
+python train.py --profile project --data-root data --weights checkpoints/DUTS_TIMESTAMP/best_miou.pt --freeze-backbone
 ```
-*The `--weights` flag performs a **weights-only initialization**. Unlike `--resume`, it starts the epoch counter from 0 and initializes a fresh optimizer and scheduler.*
+*The `--weights` flag performs a **weights-only initialization**. Unlike `--resume`, it starts the epoch counter from 0 and initializes a fresh optimizer and scheduler. Adding `--freeze-backbone` sets `requires_grad=False` on the `LearningToDownsample` and `GlobalFeatureExtractor` modules, only optimizing the fusion and classifier layers.*
 
 ### Resuming Training
 To resume an interrupted training run (restores epoch, steps, optimizer states, and scheduler decay progress exactly):

@@ -378,6 +378,17 @@ def train(cfg: Config) -> None:
         load_checkpoint(cfg.weights, model, map_location=device, weights_only=True)
         logger.info(f"Loaded pre-trained weights from {cfg.weights} for Transfer Learning.")
 
+    # Freeze backbone if requested (Feature Extraction Mode)
+    if getattr(cfg, "freeze_backbone", False):
+        for param in model.learning_to_downsample.parameters():
+            param.requires_grad = False
+        for param in model.global_feature_extractor.parameters():
+            param.requires_grad = False
+        logger.info("Backbone modules (LearningToDownsample & GlobalFeatureExtractor) have been FROZEN.")
+        # Recalculate parameters
+        total_p, trainable_p = count_parameters(model)
+        logger.info(f"Parameters after freezing: total={total_p:,}  trainable={trainable_p:,}")
+
     # Optimizer, scheduler, scaler
     optimizer = build_optimizer(model, cfg)
     total_iters = len(train_loader) * cfg.epochs
@@ -578,6 +589,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
     p.add_argument("--weights", type=str, default=None,
                    help="Path to pre-trained weights for transfer learning / fine-tuning (weights-only)")
+    p.add_argument("--freeze-backbone", action="store_true",
+                   help="Freeze the backbone (LearningToDownsample & GlobalFeatureExtractor) for transfer learning")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--early-stopping", type=int, default=None,
@@ -634,6 +647,8 @@ def main() -> None:
         cfg.resume = args.resume
     if args.weights:
         cfg.weights = args.weights
+    if args.freeze_backbone:
+        cfg.freeze_backbone = True
     if args.seed is not None:
         cfg.seed = args.seed
     if args.device:
