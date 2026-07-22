@@ -187,6 +187,7 @@ def train_one_epoch(
             logger.error(f"Non-finite loss detected at step {global_step}: {total_loss.item()}")
             raise RuntimeError(f"Training diverged (loss={total_loss.item()}) at step {global_step}")
 
+        step_before = optimizer._step_count
         if scaler is not None:
             scaler.scale(total_loss).backward()
             if cfg.gradient_clip_enabled:
@@ -200,9 +201,10 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_max_norm)
             optimizer.step()
 
-        # Step iteration-based scheduler (PolyLR)
+        # Step iteration-based scheduler (PolyLR) only if optimizer actually stepped
         if cfg.scheduler.lower() == "poly":
-            scheduler.step()
+            if optimizer._step_count > step_before:
+                scheduler.step()
 
         global_step += 1
         num_batches += 1
@@ -537,11 +539,14 @@ def train(cfg: Config) -> None:
 
     # Wrap model with DDP if distributed training is enabled
     if is_ddp:
+        # find_unused_parameters is only needed if there are parameters in the model 
+        # that are not used in forward (e.g. standard FastSCNN with aux=False)
+        find_unused = (cfg.model == "fast_scnn" and not cfg.aux)
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=find_unused,
         )
 
     # Optimizer, scheduler, scaler
