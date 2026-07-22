@@ -89,6 +89,7 @@ def load_checkpoint(
     scaler: Optional[Any] = None,
     map_location: Optional[str | torch.device] = None,
     weights_only: bool = False,
+    task_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Load a checkpoint.
 
@@ -96,6 +97,8 @@ def load_checkpoint(
     ----------
     weights_only : bool
         If True, only load model weights (ignore optimizer, scheduler, etc.).
+    task_mode : str, optional
+        Expected task mode ("segmentation" or "ddc_matting") to validate against.
 
     Returns
     -------
@@ -106,6 +109,17 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+
+    # Validate task mode compatibility
+    if task_mode is not None:
+        saved_config = checkpoint.get("config", {})
+        saved_task_mode = saved_config.get("task_mode")
+        if saved_task_mode and saved_task_mode != task_mode:
+            logger.warning(
+                f"⚠️ TASK MODE MISMATCH: The loaded checkpoint was trained in '{saved_task_mode}' mode, "
+                f"but the current process is configured for '{task_mode}' mode. "
+                "This might lead to runtime errors or incorrect predictions."
+            )
 
     # Handle DataParallel / DDP module. prefix
     state_dict = checkpoint.get("model_state_dict", {})

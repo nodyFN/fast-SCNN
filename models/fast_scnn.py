@@ -576,6 +576,33 @@ class FastSCNN(nn.Module):
 
 
 # ===========================================================================
+# Fast-SCNN Matting Adapter (for DDC Alpha-Free Matting task mode)
+# ===========================================================================
+
+
+class FastSCNNMattingAdapter(nn.Module):
+    """Adapter wrapper converting standard single-channel Fast-SCNN output
+    to match the dual-head interface expected by DDC matting training loops.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        logits = self.model(x)  # [B, 1, H, W]
+        prob = torch.sigmoid(logits)
+        return {
+            "coarse_logits": logits,
+            "coarse_prob": prob,
+            "fine_logits": logits,
+            "fine_prob": prob,
+            "coarse_logits_lowres": logits,
+            "coarse_prompt": prob,
+        }
+
+
+# ===========================================================================
 # Utilities for benchmarking
 # ===========================================================================
 

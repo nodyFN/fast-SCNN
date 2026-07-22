@@ -65,8 +65,12 @@ def postprocess(
     original_h: int,
     original_w: int,
     model_name: str = "fast_scnn",
+    task_mode: str = "segmentation",
+    threshold: float = 0.5,
 ) -> Dict[str, np.ndarray]:
     """Convert model output to prediction maps at original resolution."""
+    is_ddc = (task_mode == "ddc_matting")
+
     if model_name == "fast_scnn_salient" or isinstance(output, dict):
         fine_logits = output["fine_logits"]
         fine_prob = output["fine_prob"]
@@ -95,6 +99,19 @@ def postprocess(
         
     mask_255 = (pred_class * 255).astype(np.uint8)
 
+    if is_ddc:
+        alpha_u8 = (prob_fg.clip(0, 1) * 255).round().astype(np.uint8)
+        alpha_u16 = (prob_fg.clip(0, 1) * 65535).round().astype(np.uint16)
+        class_mask = (prob_fg >= threshold).astype(np.uint8)
+        binary_mask = (class_mask * 255).astype(np.uint8)
+        return {
+            "class_mask": class_mask,
+            "binary_mask": binary_mask,
+            "alpha": alpha_u8,
+            "alpha_u16": alpha_u16,
+            "fg_probability": prob_fg,
+        }
+
     return {
         "class_mask": pred_class,       # 0/1
         "binary_mask": mask_255,        # 0/255
@@ -114,6 +131,13 @@ def create_overlay(
     mask_rgb[class_mask == 1] = color
     overlay = cv2.addWeighted(overlay, 1 - alpha, mask_rgb, alpha, 0)
     return overlay
+
+
+def create_matting_overlay(image_bgr: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
+    """Alpha-blend the image with black background using the alpha matte."""
+    alpha_normalized = alpha_u8.astype(np.float32) / 255.0
+    overlay = image_bgr.astype(np.float32) * alpha_normalized[..., np.newaxis]
+    return overlay.astype(np.uint8)
 
 
 def find_gt_mask_path(image_path: Path, gt_arg: Optional[str] = None) -> Optional[Path]:
@@ -318,6 +342,8 @@ def infer_single(
     gt_arg: Optional[str] = None,
     merge_arg: Optional[str] = None,
     use_cuda_sync: bool = False,
+    task_mode: str = "segmentation",
+    threshold: float = 0.5,
 ) -> Dict[str, float]:
     """Run inference on a single image with timing."""
     timings: Dict[str, float] = {}
@@ -360,8 +386,17 @@ def infer_single(
     if use_cuda_sync:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    results = postprocess(output, original_h, original_w, model_name=model_name)
-    overlay = create_overlay(image_bgr, results["class_mask"])
+    results = postprocess(
+        output, original_h, original_w,
+        model_name=model_name, task_mode=task_mode,
+        threshold=threshold,
+    )
+    
+    is_matting = (task_mode == "ddc_matting")
+    if is_matting:
+        overlay = create_matting_overlay(image_bgr, results["alpha"])
+    else:
+        overlay = create_overlay(image_bgr, results["class_mask"])
 
     # Load GT mask if available for comparison
     gt_mask = None
@@ -395,9 +430,16 @@ def infer_single(
     stem = image_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_dir / f"{stem}_input.jpg"), image_bgr)
-    cv2.imwrite(str(output_dir / f"{stem}_class.png"), results["class_mask"])
-    cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
-    cv2.imwrite(str(output_dir / f"{stem}_overlay.jpg"), overlay)
+    
+    if is_matting:
+        cv2.imwrite(str(output_dir / f"{stem}_alpha.png"), results["alpha"])
+        cv2.imwrite(str(output_dir / f"{stem}_alpha_u16.png"), results["alpha_u16"])
+        cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
+        cv2.imwrite(str(output_dir / f"{stem}_overlay.png"), overlay)
+    else:
+        cv2.imwrite(str(output_dir / f"{stem}_class.png"), results["class_mask"])
+        cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
+        cv2.imwrite(str(output_dir / f"{stem}_overlay.jpg"), overlay)
 
     # If GT mask exists, save the TP/FP/FN comparison overlay
     if gt_mask is not None:
@@ -436,6 +478,8 @@ def infer_folder(
     model_name: str = "fast_scnn",
     gt_arg: Optional[str] = None,
     merge_arg: Optional[str] = None,
+    task_mode: str = "segmentation",
+    threshold: float = 0.5,
 ) -> None:
     """Run inference on all images in a folder."""
     images = sorted(
@@ -454,6 +498,7 @@ def infer_folder(
             timings = infer_single(
                 model, img_path, device, height, width, output_dir,
                 model_name=model_name, gt_arg=gt_arg, merge_arg=merge_arg, use_cuda_sync=use_cuda_sync,
+                task_mode=task_mode, threshold=threshold,
             )
             all_model_ms.append(timings["model_ms"])
             all_e2e_ms.append(timings["e2e_ms"])
@@ -521,22 +566,29 @@ def main() -> None:
     else:
         model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)
         
-    load_checkpoint(args.checkpoint, model, map_location=device, weights_only=True)
+    ckpt = load_checkpoint(args.checkpoint, model, map_location=device, weights_only=True)
     model.eval()
     logger.info(f"Model ({args.model}) loaded on {device}")
+
+    # Auto-detect task mode from checkpoint
+    checkpoint_config = ckpt.get("config", {})
+    task_mode = checkpoint_config.get("task_mode", "segmentation")
+    threshold = checkpoint_config.get("foreground_threshold", 0.5)
+    logger.info(f"Auto-detected task mode: {task_mode}, threshold: {threshold}")
 
     input_path = Path(args.input)
     if input_path.is_dir():
         infer_folder(
             model, input_path, device, args.height, args.width, output_dir,
             model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
+            task_mode=task_mode, threshold=threshold,
         )
     elif input_path.is_file():
         use_cuda_sync = device.type == "cuda"
         timings = infer_single(
             model, input_path, device, args.height, args.width,
             output_dir, model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
-            use_cuda_sync=use_cuda_sync,
+            use_cuda_sync=use_cuda_sync, task_mode=task_mode, threshold=threshold,
         )
         print(f"\nTiming breakdown:")
         for k, v in timings.items():

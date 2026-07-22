@@ -214,3 +214,126 @@ def _colorize_mask(mask: np.ndarray, colors: Dict[int, tuple]) -> np.ndarray:
     for cls_id, color in colors.items():
         rgb[mask == cls_id] = color
     return rgb
+
+
+# ===========================================================================
+# Matting visualization
+# ===========================================================================
+
+
+def visualize_matting(
+    images: torch.Tensor,
+    trimaps: torch.Tensor,
+    coarse_alpha: torch.Tensor,
+    fine_alpha: torch.Tensor,
+    ddc_images: Optional[torch.Tensor] = None,
+    gt_alpha: Optional[torch.Tensor] = None,
+    save_path: Optional[Path | str] = None,
+    num_samples: int = 4,
+    threshold: float = 0.5,
+) -> None:
+    """Visualize matting training results.
+
+    Parameters
+    ----------
+    images : [B, C, H, W]  ImageNet-normalized
+    trimaps : [B, 1, H, W]  {0.0, 0.5, 1.0}
+    coarse_alpha : [B, 1, H, W]  [0, 1]
+    fine_alpha : [B, 1, H, W]  [0, 1]
+    ddc_images : [B, 3, H, W]  raw RGB [0, 1], optional
+    gt_alpha : [B, 1, H, W]  ground truth alpha, optional
+    """
+    n = min(num_samples, images.shape[0])
+    has_gt = gt_alpha is not None
+    has_ddc = ddc_images is not None
+    ncols = 6 + (1 if has_ddc else 0) + (2 if has_gt else 0)
+
+    fig, axes = plt.subplots(n, ncols, figsize=(ncols * 3, n * 3))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    for row in range(n):
+        col = 0
+        img = denormalize(images[row].cpu().numpy())
+
+        # 1. Original RGB
+        axes[row, col].imshow(img)
+        if row == 0:
+            axes[row, col].set_title("RGB", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 2. Trimap (color-coded)
+        tri = trimaps[row, 0].cpu().numpy()
+        tri_rgb = np.zeros((*tri.shape, 3), dtype=np.float32)
+        tri_rgb[tri > 0.75] = [1, 1, 1]  # FG = white
+        tri_rgb[(tri > 0.25) & (tri < 0.75)] = [0.5, 0.5, 0.5]  # Unknown = gray
+        # BG stays black
+        axes[row, col].imshow(tri_rgb)
+        if row == 0:
+            axes[row, col].set_title("Trimap", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 3. Coarse Alpha
+        ca = coarse_alpha[row, 0].cpu().numpy()
+        axes[row, col].imshow(ca, cmap="gray", vmin=0, vmax=1)
+        if row == 0:
+            axes[row, col].set_title("Coarse α", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 4. Fine Alpha
+        fa = fine_alpha[row, 0].cpu().numpy()
+        axes[row, col].imshow(fa, cmap="gray", vmin=0, vmax=1)
+        if row == 0:
+            axes[row, col].set_title("Fine α", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 5. Fine Binary Preview
+        fb = (fa >= threshold).astype(np.float32)
+        axes[row, col].imshow(fb, cmap="gray", vmin=0, vmax=1)
+        if row == 0:
+            axes[row, col].set_title(f"Binary (≥{threshold})", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 6. Fine Alpha Overlay
+        overlay = img * fa[..., np.newaxis]  # alpha-blended
+        axes[row, col].imshow(overlay.clip(0, 1))
+        if row == 0:
+            axes[row, col].set_title("α Overlay", fontsize=8)
+        axes[row, col].axis("off")
+        col += 1
+
+        # 7. DDC RGB (if available)
+        if has_ddc:
+            ddc_rgb = ddc_images[row].cpu().numpy().transpose(1, 2, 0)
+            axes[row, col].imshow(ddc_rgb.clip(0, 1))
+            if row == 0:
+                axes[row, col].set_title("DDC RGB", fontsize=8)
+            axes[row, col].axis("off")
+            col += 1
+
+        # 8-9. GT Alpha + Error (if available)
+        if has_gt:
+            gta = gt_alpha[row, 0].cpu().numpy()
+            axes[row, col].imshow(gta, cmap="gray", vmin=0, vmax=1)
+            if row == 0:
+                axes[row, col].set_title("GT α", fontsize=8)
+            axes[row, col].axis("off")
+            col += 1
+
+            err = np.abs(fa - gta)
+            axes[row, col].imshow(err, cmap="hot", vmin=0, vmax=1)
+            if row == 0:
+                axes[row, col].set_title("|Error|", fontsize=8)
+            axes[row, col].axis("off")
+
+    fig.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+

@@ -38,20 +38,28 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from config import Config, get_paper_config, get_project_config
+from config import (
+    Config, get_paper_config, get_project_config,
+    get_ddc_am2k_config, get_ddc_p3m_config, get_ddc_tv_config,
+)
 from dataset import (
     SegmentationDataset,
+    MattingDataset,
     build_dataloader,
     build_train_transform,
     build_val_transform,
+    build_matting_train_transform,
+    build_matting_val_transform,
 )
 from models import FastSCNN, FastSCNNSalient, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
+from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
 from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss
+from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
 from utils.scheduler import build_scheduler
 from utils.seed import seed_everything
-from utils.visualization import save_all_curves, visualize_segmentation
+from utils.visualization import save_all_curves, visualize_segmentation, visualize_matting
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,6 +300,198 @@ def validate(
 
 
 # ===========================================================================
+# DDC Matting Training and Validation Loops
+# ===========================================================================
+
+
+def train_one_epoch_matting(
+    model: nn.Module,
+    dataloader,
+    known_loss_fn: KnownRegionL1Loss,
+    ddc_loss_fn: DirectionalDistanceConsistencyLoss,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: Optional[torch.amp.GradScaler],
+    device: torch.device,
+    cfg: Config,
+    global_step: int,
+    epoch: int,
+    writer: Optional[SummaryWriter] = None,
+    use_amp: bool = False,
+) -> tuple:
+    """Run one DDC matting training epoch.
+
+    Returns (loss_dict, updated_global_step).
+    """
+    model.train()
+    running = {}
+    num_batches = 0
+
+    disable_tqdm = (os.environ.get("RANK", "0") != "0")
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [matting]", leave=False, disable=disable_tqdm)
+
+    for batch in pbar:
+        images = batch["image"].to(device, non_blocking=True)
+        ddc_images = batch["ddc_image"].to(device, non_blocking=True)
+        trimaps = batch["trimap"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Model forward (inside AMP)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            output = model(images)
+
+            # Extract alpha predictions (sigmoid already applied in model)
+            coarse_alpha = output["coarse_prob"]  # [B, 1, H, W]
+            fine_alpha = output["fine_prob"]       # [B, 1, H, W]
+
+            # Known L1 losses (AMP-safe, operates on float alpha)
+            coarse_known_loss = known_loss_fn(coarse_alpha, trimaps)
+            fine_known_loss = known_loss_fn(fine_alpha, trimaps)
+
+        # DDC Loss — computed OUTSIDE AMP for numerical stability (float32)
+        with torch.autocast(device_type=device.type, enabled=False):
+            ddc_loss = ddc_loss_fn(
+                fine_alpha.float(),
+                ddc_images.float(),
+            )
+
+        # Total loss
+        total_loss = (
+            cfg.lambda_coarse_known * coarse_known_loss
+            + cfg.lambda_fine_known * fine_known_loss
+            + cfg.ddc_lambda * ddc_loss
+        )
+
+        # Build loss dict
+        losses = {
+            "total": total_loss,
+            "coarse_known": coarse_known_loss,
+            "fine_known": fine_known_loss,
+            "ddc": ddc_loss,
+        }
+
+        if not running:
+            running = {k: 0.0 for k in losses.keys()}
+
+        # NaN / Inf check
+        if not torch.isfinite(total_loss):
+            logger.error(f"Non-finite loss at step {global_step}: {total_loss.item()}")
+            raise RuntimeError(f"Training diverged (loss={total_loss.item()}) at step {global_step}")
+
+        if scaler is not None:
+            scaler.scale(total_loss).backward()
+            if cfg.gradient_clip_enabled:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            if cfg.gradient_clip_enabled:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_max_norm)
+            optimizer.step()
+
+        # Step iteration-based scheduler (PolyLR)
+        if cfg.scheduler.lower() == "poly":
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, message="Detected call of.*")
+                scheduler.step()
+
+        global_step += 1
+        num_batches += 1
+
+        for k in running:
+            running[k] += losses[k].item()
+
+        pbar.set_postfix(loss=f"{total_loss.item():.4f}")
+
+        # TensorBoard per-step logging
+        if writer and global_step % 50 == 0:
+            writer.add_scalar("Loss/train_step", total_loss.item(), global_step)
+            writer.add_scalar("Loss/ddc_step", ddc_loss.item(), global_step)
+
+            # Statistics
+            with torch.no_grad():
+                known_mask = ((trimaps < 0.25) | (trimaps > 0.75))
+                unknown_mask = ((trimaps > 0.25) & (trimaps < 0.75))
+                n_total = trimaps.numel()
+                writer.add_scalar("Statistics/known_pixel_ratio",
+                                  known_mask.float().sum().item() / max(n_total, 1), global_step)
+                writer.add_scalar("Statistics/unknown_pixel_ratio",
+                                  unknown_mask.float().sum().item() / max(n_total, 1), global_step)
+                writer.add_scalar("Statistics/alpha_mean", fine_alpha.mean().item(), global_step)
+                writer.add_scalar("Statistics/alpha_min", fine_alpha.min().item(), global_step)
+                writer.add_scalar("Statistics/alpha_max", fine_alpha.max().item(), global_step)
+
+    # Average losses
+    avg = {k: v / max(num_batches, 1) for k, v in running.items()}
+
+    # DDP all-reduce
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        for k in avg:
+            loss_tensor = torch.tensor([avg[k]], device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg[k] = (loss_tensor / dist.get_world_size()).item()
+
+    return avg, global_step
+
+
+@torch.inference_mode()
+def validate_matting(
+    model: nn.Module,
+    dataloader,
+    known_loss_fn: KnownRegionL1Loss,
+    device: torch.device,
+    metrics: MattingMetrics,
+    cfg: Config,
+    use_amp: bool = False,
+) -> Dict[str, float]:
+    """Run matting validation. Returns loss + metric dict."""
+    model.eval()
+    metrics.reset()
+    running_loss = 0.0
+    num_batches = 0
+
+    for batch in dataloader:
+        images = batch["image"].to(device, non_blocking=True)
+        trimaps = batch["trimap"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            output = model(images)
+            fine_alpha = output["fine_prob"]  # [B, 1, H, W]
+            coarse_alpha = output["coarse_prob"]
+
+            # Loss on known regions only
+            fine_known_loss = known_loss_fn(fine_alpha, trimaps)
+
+        running_loss += fine_known_loss.item()
+        num_batches += 1
+
+        # Update matting metrics
+        # Use binary mask as reference (since we don't have GT alpha)
+        gt = masks.unsqueeze(1).float()  # [B, 1, H, W]
+        metrics.update(fine_alpha, gt, trimap=trimaps)
+
+    # DDP reduce
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        loss_tensor = torch.tensor([running_loss / max(num_batches, 1)], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = (loss_tensor / dist.get_world_size()).item()
+    else:
+        avg_loss = running_loss / max(num_batches, 1)
+
+    metrics.all_reduce()
+    metric_results = metrics.compute()
+    metric_results["val_loss"] = avg_loss
+    return metric_results
+
+
+# ===========================================================================
 # Smoke test with synthetic data
 # ===========================================================================
 
@@ -465,16 +665,42 @@ def train(cfg: Config) -> None:
 
     logger.info(f"Device: {device}")
     logger.info(f"Profile: {cfg.profile}")
+    logger.info(f"Task mode: {cfg.task_mode}")
     logger.info(f"AMP: {cfg.amp and device.type == 'cuda'}")
 
-    # Dataset & DataLoader
-    train_transform = build_train_transform(
-        cfg.train_height, cfg.train_width, cfg.aug_scale_min, cfg.aug_scale_max,
-    )
-    val_transform = build_val_transform(cfg.val_height, cfg.val_width)
+    is_matting = (cfg.task_mode == "ddc_matting")
 
-    train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform, allow_threshold=cfg.allow_threshold)
-    val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform, allow_threshold=cfg.allow_threshold)
+    # Dataset & DataLoader
+    if is_matting:
+        crop_h = cfg.matting_crop_height
+        crop_w = cfg.matting_crop_width
+        train_transform = build_matting_train_transform(
+            crop_h, crop_w, cfg.aug_scale_min, cfg.aug_scale_max,
+        )
+        val_transform = build_matting_val_transform(crop_h, crop_w)
+        train_ds = MattingDataset(
+            cfg.train_dir, transform=train_transform,
+            trimap_source=cfg.trimap_source,
+            trimap_kernel_min=cfg.trimap_kernel_min,
+            trimap_kernel_max=cfg.trimap_kernel_max,
+            allow_threshold=cfg.allow_threshold,
+            collapse_nonzero_to_foreground=cfg.collapse_nonzero_to_foreground,
+        )
+        val_ds = MattingDataset(
+            cfg.val_dir, transform=val_transform,
+            trimap_source=cfg.trimap_source,
+            trimap_kernel_min=cfg.trimap_kernel_min,
+            trimap_kernel_max=cfg.trimap_kernel_max,
+            allow_threshold=cfg.allow_threshold,
+            collapse_nonzero_to_foreground=cfg.collapse_nonzero_to_foreground,
+        )
+    else:
+        train_transform = build_train_transform(
+            cfg.train_height, cfg.train_width, cfg.aug_scale_min, cfg.aug_scale_max,
+        )
+        val_transform = build_val_transform(cfg.val_height, cfg.val_width)
+        train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform, allow_threshold=cfg.allow_threshold)
+        val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform, allow_threshold=cfg.allow_threshold)
     logger.info(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     if is_ddp:
@@ -509,12 +735,13 @@ def train(cfg: Config) -> None:
             dropout_p=cfg.dropout_p,
         ).to(device)
     else:
+        # For matting, standard FastSCNN outputs 1 channel and disables auxiliary heads
+        num_classes = 1 if is_matting else cfg.num_classes
+        aux = False if is_matting else cfg.aux
         model = FastSCNN(
-            num_classes=cfg.num_classes, aux=cfg.aux,
+            num_classes=num_classes, aux=aux,
             ppm_pool_sizes=cfg.ppm_pool_sizes, dropout_p=cfg.dropout_p,
         ).to(device)
-    total_p, trainable_p = count_parameters(model)
-    logger.info(f"Parameters: total={total_p:,}  trainable={trainable_p:,}")
 
     # Load pre-trained weights (Transfer Learning / weights-only)
     if getattr(cfg, "weights", None):
@@ -534,9 +761,14 @@ def train(cfg: Config) -> None:
             for param in model.global_feature_extractor.parameters():
                 param.requires_grad = False
         logger.info("Backbone modules (LearningToDownsample & GlobalFeatureExtractor) have been FROZEN.")
-        # Recalculate parameters
-        total_p, trainable_p = count_parameters(model)
-        logger.info(f"Parameters after freezing: total={total_p:,}  trainable={trainable_p:,}")
+
+    # Wrap FastSCNN with matting adapter if needed
+    if is_matting and cfg.model == "fast_scnn":
+        from models.fast_scnn import FastSCNNMattingAdapter
+        model = FastSCNNMattingAdapter(model).to(device)
+
+    total_p, trainable_p = count_parameters(model)
+    logger.info(f"Parameters: total={total_p:,}  trainable={trainable_p:,}")
 
     # Wrap model with DDP if distributed training is enabled
     if is_ddp:
@@ -556,12 +788,32 @@ def train(cfg: Config) -> None:
     scheduler = build_scheduler(
         cfg.scheduler, optimizer, total_iters, cfg.epochs, cfg.poly_power,
         cfg.cosine_eta_min,
+        milestones=cfg.scheduler_milestones,
+        gamma=cfg.scheduler_gamma,
     )
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device=device.type) if use_amp else None
 
     # Loss
-    if cfg.model == "fast_scnn_salient":
+    if is_matting:
+        known_loss_fn = KnownRegionL1Loss().to(device)
+        ddc_loss_fn = DirectionalDistanceConsistencyLoss(
+            window_size=cfg.ddc_window_size,
+            num_neighbors=cfg.ddc_num_neighbors,
+            padding_mode=cfg.ddc_padding_mode,
+            exclude_center=cfg.ddc_exclude_center,
+            reduction=cfg.ddc_reduction,
+            chunk_size=cfg.ddc_chunk_size,
+            downsample_factor=cfg.ddc_downsample_factor,
+        ).to(device)
+        criterion = None  # Not used for matting
+        logger.info(
+            f"DDC Matting Loss: λ_coarse_known={cfg.lambda_coarse_known}, "
+            f"λ_fine_known={cfg.lambda_fine_known}, λ_ddc={cfg.ddc_lambda}, "
+            f"window={cfg.ddc_window_size}, neighbors={cfg.ddc_num_neighbors}, "
+            f"chunk_size={cfg.ddc_chunk_size}, downsample={cfg.ddc_downsample_factor}"
+        )
+    elif cfg.model == "fast_scnn_salient":
         criterion = SalientSegmentationLoss(
             lambda_coarse=cfg.salient_lambda_coarse,
             lambda_fine=cfg.salient_lambda_fine,
@@ -574,6 +826,8 @@ def train(cfg: Config) -> None:
             focal_gamma=cfg.salient_focal_gamma,
             pos_weight=cfg.salient_pos_weight,
         ).to(device)
+        known_loss_fn = None
+        ddc_loss_fn = None
     else:
         criterion = CombinedSegmentationLoss(
             ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
@@ -581,23 +835,40 @@ def train(cfg: Config) -> None:
             focal_gamma=cfg.focal_gamma, class_weights=cfg.class_weights,
             ignore_index=cfg.ignore_index,
         ).to(device)
+        known_loss_fn = None
+        ddc_loss_fn = None
 
     # Metrics
-    metrics_obj = SegmentationMetrics(
-        2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
-        cfg.ignore_index
-    )
+    if is_matting:
+        metrics_obj = MattingMetrics(
+            foreground_threshold=cfg.foreground_threshold,
+            has_alpha_gt=False,  # Binary mask validation by default
+        )
+    else:
+        metrics_obj = SegmentationMetrics(
+            2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+            cfg.ignore_index
+        )
 
     # TensorBoard
     writer = SummaryWriter(log_dir=str(cfg.tensorboard_dir))
 
     # History
-    history: Dict[str, List[float]] = {
-        "train_loss": [], "val_loss": [],
-        "pixel_accuracy": [], "miou": [],
-        "foreground_iou": [], "foreground_dice": [],
-        "learning_rate": [],
-    }
+    if is_matting:
+        history: Dict[str, List[float]] = {
+            "train_loss": [], "val_loss": [],
+            "coarse_known_loss": [], "fine_known_loss": [], "ddc_loss": [],
+            "mad": [], "mse": [],
+            "foreground_iou": [], "foreground_dice": [],
+            "learning_rate": [],
+        }
+    else:
+        history: Dict[str, List[float]] = {
+            "train_loss": [], "val_loss": [],
+            "pixel_accuracy": [], "miou": [],
+            "foreground_iou": [], "foreground_dice": [],
+            "learning_rate": [],
+        }
 
     # Resume
     start_epoch = 0
@@ -606,7 +877,7 @@ def train(cfg: Config) -> None:
     if cfg.resume:
         ckpt = load_checkpoint(
             cfg.resume, model, optimizer, scheduler, scaler,
-            map_location=device,
+            map_location=device, task_mode=cfg.task_mode,
         )
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
@@ -624,26 +895,51 @@ def train(cfg: Config) -> None:
             t0 = time.time()
 
             # Train
-            train_losses, global_step = train_one_epoch(
-                model, train_loader, criterion, optimizer, scheduler,
-                scaler, device, cfg, global_step, epoch, writer, use_amp,
-            )
+            if is_matting:
+                train_losses, global_step = train_one_epoch_matting(
+                    model, train_loader, known_loss_fn, ddc_loss_fn, optimizer, scheduler,
+                    scaler, device, cfg, global_step, epoch, writer, use_amp,
+                )
+            else:
+                train_losses, global_step = train_one_epoch(
+                    model, train_loader, criterion, optimizer, scheduler,
+                    scaler, device, cfg, global_step, epoch, writer, use_amp,
+                )
 
-            # Epoch-based scheduler step (CosineAnnealing)
-            if cfg.scheduler.lower() == "cosine":
+            # Epoch-based scheduler step (CosineAnnealing / MultiStep)
+            if cfg.scheduler.lower() in ("cosine", "multistep"):
                 import warnings
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=UserWarning, message="Detected call of.*")
                     scheduler.step()
 
             # Validate
-            val_results = validate(model, val_loader, criterion, device, metrics_obj, cfg, use_amp)
+            if is_matting:
+                val_results = validate_matting(model, val_loader, known_loss_fn, device, metrics_obj, cfg, use_amp)
+            else:
+                val_results = validate(model, val_loader, criterion, device, metrics_obj, cfg, use_amp)
 
             elapsed = time.time() - t0
             current_lr = optimizer.param_groups[0]["lr"]
 
             # Log
-            if cfg.model == "fast_scnn_salient":
+            if is_matting:
+                logger.info(
+                    f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
+                    f"Train loss={train_losses['total']:.4f} (CoarseL1={train_losses['coarse_known']:.4f} "
+                    f"FineL1={train_losses['fine_known']:.4f} DDC={train_losses['ddc']:.4f}) | "
+                    f"Val loss={val_results['val_loss']:.4f} | "
+                    f"mIoU={val_results['miou']:.4f} "
+                    f"FG_IoU={val_results['foreground_iou']:.4f} "
+                    f"FG_Dice={val_results['foreground_dice']:.4f} | "
+                    f"LR={current_lr:.6f} | Best mIoU={best_miou:.4f}"
+                )
+                logger.info(
+                    f"  Matting validation: SAD={val_results['sad']:.1f} MAD={val_results['mad']:.4f} "
+                    f"MSE={val_results['mse']:.6f} GradErr={val_results['gradient_error']:.4f} "
+                    f"SAD-T={val_results['sad_t']:.1f} MSE-T={val_results['mse_t']:.6f}"
+                )
+            elif cfg.model == "fast_scnn_salient":
                 logger.info(
                     f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
                     f"Train loss={train_losses['total']:.4f} (Coarse={train_losses['coarse']:.4f} "
@@ -681,8 +977,15 @@ def train(cfg: Config) -> None:
             if rank == 0:
                 history["train_loss"].append(train_losses["total"])
                 history["val_loss"].append(val_results["val_loss"])
-                history["pixel_accuracy"].append(val_results["pixel_accuracy"])
-                history["miou"].append(val_results["miou"])
+                if is_matting:
+                    history["coarse_known_loss"].append(train_losses["coarse_known"])
+                    history["fine_known_loss"].append(train_losses["fine_known"])
+                    history["ddc_loss"].append(train_losses["ddc"])
+                    history["mad"].append(val_results["mad"])
+                    history["mse"].append(val_results["mse"])
+                else:
+                    history["pixel_accuracy"].append(val_results["pixel_accuracy"])
+                    history["miou"].append(val_results["miou"])
                 history["foreground_iou"].append(val_results["foreground_iou"])
                 history["foreground_dice"].append(val_results["foreground_dice"])
                 history["learning_rate"].append(current_lr)
@@ -691,15 +994,24 @@ def train(cfg: Config) -> None:
             if rank == 0 and writer:
                 writer.add_scalar("Loss/train", train_losses["total"], epoch)
                 writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
-                if cfg.model == "fast_scnn_salient":
+                if is_matting:
+                    writer.add_scalar("Loss/coarse_known", train_losses["coarse_known"], epoch)
+                    writer.add_scalar("Loss/fine_known", train_losses["fine_known"], epoch)
+                    writer.add_scalar("Loss/ddc", train_losses["ddc"], epoch)
+                    writer.add_scalar("Metrics/mad", val_results["mad"], epoch)
+                    writer.add_scalar("Metrics/mse", val_results["mse"], epoch)
+                elif cfg.model == "fast_scnn_salient":
                     writer.add_scalar("Loss/coarse", train_losses["coarse"], epoch)
                     writer.add_scalar("Loss/fine", train_losses["fine"], epoch)
                     writer.add_scalar("Loss/boundary", train_losses["boundary"], epoch)
                 else:
                     writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
                     writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
-                writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
-                writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
+                if not is_matting:
+                    writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
+                    writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
+                else:
+                    writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
                 writer.add_scalar("Metrics/foreground_iou", val_results["foreground_iou"], epoch)
                 writer.add_scalar("Metrics/foreground_dice", val_results["foreground_dice"], epoch)
                 writer.add_scalar("LearningRate", current_lr, epoch)
@@ -708,8 +1020,6 @@ def train(cfg: Config) -> None:
             if rank == 0:
                 if epoch % max(cfg.epochs // 20, 1) == 0 or epoch == cfg.epochs - 1:
                     try:
-                        # DDP model forward should use model.module for validation if we unpack it, 
-                        # but standard forward on DDP wrapper also works in eval. Let's use DDP model.
                         model.eval()
                         sample_batch = next(iter(val_loader))
                         imgs = sample_batch["image"].to(device)
@@ -717,17 +1027,29 @@ def train(cfg: Config) -> None:
                         with torch.inference_mode():
                             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                                 preds_outputs = model(imgs)
-                        if cfg.model == "fast_scnn_salient":
-                            preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
-                            probs = preds_outputs["fine_prob"].squeeze(1)
+                        if is_matting:
+                            visualize_matting(
+                                images=imgs,
+                                trimaps=sample_batch["trimap"].to(device),
+                                coarse_alpha=preds_outputs["coarse_prob"],
+                                fine_alpha=preds_outputs["fine_prob"],
+                                ddc_images=sample_batch["ddc_image"].to(device) if "ddc_image" in sample_batch else None,
+                                save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
+                                num_samples=cfg.num_vis_samples,
+                                threshold=cfg.foreground_threshold,
+                            )
                         else:
-                            preds = preds_outputs.argmax(dim=1)
-                            probs = torch.softmax(preds_outputs, dim=1)[:, 1]
-                        visualize_segmentation(
-                            imgs, msks, preds, probs,
-                            save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
-                            num_samples=cfg.num_vis_samples,
-                        )
+                            if cfg.model == "fast_scnn_salient":
+                                preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
+                                probs = preds_outputs["fine_prob"].squeeze(1)
+                            else:
+                                preds = preds_outputs.argmax(dim=1)
+                                probs = torch.softmax(preds_outputs, dim=1)[:, 1]
+                            visualize_segmentation(
+                                imgs, msks, preds, probs,
+                                save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
+                                num_samples=cfg.num_vis_samples,
+                            )
                     except Exception as e:
                         logger.warning(f"Visualization failed: {e}")
 
@@ -798,7 +1120,7 @@ def train(cfg: Config) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Fast-SCNN")
-    p.add_argument("--profile", choices=["paper", "project"], default=None,
+    p.add_argument("--profile", choices=["paper", "project", "paper_am2k", "paper_p3m", "tv_ddc"], default=None,
                    help="Training profile (default: use config.py defaults)")
     p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default=None,
                    help="Model architecture to train (default: fast_scnn)")
@@ -807,7 +1129,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None, dest="learning_rate")
     p.add_argument("--optimizer", choices=["sgd", "adamw"], default=None)
-    p.add_argument("--scheduler", choices=["poly", "cosine"], default=None)
+    p.add_argument("--scheduler", choices=["poly", "cosine", "multistep"], default=None)
     p.add_argument("--train-height", type=int, default=None)
     p.add_argument("--train-width", type=int, default=None)
     p.add_argument("--val-height", type=int, default=None)
@@ -828,6 +1150,26 @@ def parse_args() -> argparse.Namespace:
                    help="Allow thresholding grayscale masks to binary (0/1)")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run a minimal smoke test with synthetic data")
+
+    # DDC Matting specific arguments
+    p.add_argument("--task-mode", choices=["segmentation", "ddc_matting"], default=None)
+    p.add_argument("--loss-profile", choices=["legacy", "legacy_salient", "ddc_matting"], default=None)
+    p.add_argument("--trimap-source", choices=["binary_mask", "file"], default=None)
+    p.add_argument("--trimap-kernel-min", type=int, default=None)
+    p.add_argument("--trimap-kernel-max", type=int, default=None)
+    p.add_argument("--collapse-nonzero-to-foreground", action="store_true", default=None)
+    p.add_argument("--ddc-window-size", type=int, default=None)
+    p.add_argument("--ddc-num-neighbors", type=int, default=None)
+    p.add_argument("--ddc-lambda", type=float, default=None)
+    p.add_argument("--ddc-chunk-size", type=int, default=None)
+    p.add_argument("--ddc-downsample-factor", type=int, default=None)
+    p.add_argument("--lambda-coarse-known", type=float, default=None)
+    p.add_argument("--lambda-fine-known", type=float, default=None)
+    p.add_argument("--matting-crop-height", type=int, default=None)
+    p.add_argument("--matting-crop-width", type=int, default=None)
+    p.add_argument("--foreground-threshold", type=float, default=None)
+    p.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
+    p.add_argument("--scheduler-gamma", type=float, default=None)
     return p.parse_args()
 
 
@@ -839,6 +1181,12 @@ def main() -> None:
         cfg = get_paper_config()
     elif args.profile == "project":
         cfg = get_project_config()
+    elif args.profile == "paper_am2k":
+        cfg = get_ddc_am2k_config()
+    elif args.profile == "paper_p3m":
+        cfg = get_ddc_p3m_config()
+    elif args.profile == "tv_ddc":
+        cfg = get_ddc_tv_config()
     else:
         cfg = Config()
 
@@ -892,6 +1240,44 @@ def main() -> None:
             cfg.early_stopping_enabled = False
     if args.allow_threshold is not None:
         cfg.allow_threshold = args.allow_threshold
+
+    # DDC Matting specific overrides
+    if args.task_mode:
+        cfg.task_mode = args.task_mode
+    if args.loss_profile:
+        cfg.loss_profile = args.loss_profile
+    if args.trimap_source:
+        cfg.trimap_source = args.trimap_source
+    if args.trimap_kernel_min is not None:
+        cfg.trimap_kernel_min = args.trimap_kernel_min
+    if args.trimap_kernel_max is not None:
+        cfg.trimap_kernel_max = args.trimap_kernel_max
+    if args.collapse_nonzero_to_foreground is not None:
+        cfg.collapse_nonzero_to_foreground = args.collapse_nonzero_to_foreground
+    if args.ddc_window_size is not None:
+        cfg.ddc_window_size = args.ddc_window_size
+    if args.ddc_num_neighbors is not None:
+        cfg.ddc_num_neighbors = args.ddc_num_neighbors
+    if args.ddc_lambda is not None:
+        cfg.ddc_lambda = args.ddc_lambda
+    if args.ddc_chunk_size is not None:
+        cfg.ddc_chunk_size = args.ddc_chunk_size
+    if args.ddc_downsample_factor is not None:
+        cfg.ddc_downsample_factor = args.ddc_downsample_factor
+    if args.lambda_coarse_known is not None:
+        cfg.lambda_coarse_known = args.lambda_coarse_known
+    if args.lambda_fine_known is not None:
+        cfg.lambda_fine_known = args.lambda_fine_known
+    if args.matting_crop_height is not None:
+        cfg.matting_crop_height = args.matting_crop_height
+    if args.matting_crop_width is not None:
+        cfg.matting_crop_width = args.matting_crop_width
+    if args.foreground_threshold is not None:
+        cfg.foreground_threshold = args.foreground_threshold
+    if args.scheduler_milestones is not None:
+        cfg.scheduler_milestones = args.scheduler_milestones
+    if args.scheduler_gamma is not None:
+        cfg.scheduler_gamma = args.scheduler_gamma
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

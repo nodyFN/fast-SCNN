@@ -1,5 +1,5 @@
 """
-Centralized configuration for Fast-SCNN semantic segmentation project.
+Centralized configuration for Fast-SCNN semantic segmentation and matting project.
 
 This module defines all tunable parameters in one place. CLI arguments in
 train.py, evaluate.py, inference.py and export.py can override these defaults.
@@ -150,6 +150,42 @@ class Config:
     salient_focal_gamma: float = 2.0
     salient_pos_weight: Optional[float] = None
 
+    # ── DDC Alpha-Free Matting ────────────────────────────────────────
+    # Based on: "Training Matting Models without Alpha Labels"
+    task_mode: str = "segmentation"   # "segmentation" | "ddc_matting"
+    loss_profile: str = "legacy"      # "legacy" | "legacy_salient" | "ddc_matting"
+
+    # Trimap
+    trimap_source: str = "binary_mask"  # "binary_mask" | "file"
+    trimap_kernel_min: int = 1
+    trimap_kernel_max: int = 30
+    collapse_nonzero_to_foreground: bool = False
+
+    # DDC Loss
+    ddc_window_size: int = 11
+    ddc_num_neighbors: int = 11
+    ddc_lambda: float = 10.0
+    ddc_chunk_size: int = 4096
+    ddc_padding_mode: str = "replicate"
+    ddc_exclude_center: bool = True
+    ddc_reduction: str = "paper"
+    ddc_downsample_factor: int = 1
+
+    # DDC Matting Loss weights
+    lambda_coarse_known: float = 1.0
+    lambda_fine_known: float = 1.0
+
+    # Matting crop (paper: 512×512)
+    matting_crop_height: int = 512
+    matting_crop_width: int = 512
+
+    # Matting evaluation
+    foreground_threshold: float = 0.5
+
+    # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
+    scheduler_milestones: Optional[List[int]] = None
+    scheduler_gamma: float = 0.1
+
     def resolve_device(self) -> torch.device:
         """Return the torch.device to use."""
         if self.device == "auto":
@@ -215,4 +251,104 @@ def get_project_config() -> Config:
         gradient_clip_max_norm=1.0,
         early_stopping_enabled=True,
         early_stopping_patience=50,
+    )
+
+
+def get_ddc_am2k_config() -> Config:
+    """DDC matting config reproducing paper AM-2K animal matting settings."""
+    return Config(
+        profile="paper_am2k",
+        task_mode="ddc_matting",
+        loss_profile="ddc_matting",
+        model="fast_scnn_salient",
+        optimizer="adamw",
+        learning_rate=5e-4,
+        weight_decay=0.1,
+        scheduler="multistep",
+        scheduler_milestones=[60, 90],
+        scheduler_gamma=0.1,
+        epochs=100,
+        batch_size=16,
+        train_height=512,
+        train_width=512,
+        matting_crop_height=512,
+        matting_crop_width=512,
+        ddc_window_size=11,
+        ddc_num_neighbors=11,
+        ddc_lambda=10.0,
+        lambda_coarse_known=1.0,
+        lambda_fine_known=1.0,
+        amp=True,
+        gradient_clip_enabled=True,
+        gradient_clip_max_norm=1.0,
+        aux=False,  # Disable aux heads for matting
+        early_stopping_enabled=False,
+    )
+
+
+def get_ddc_p3m_config() -> Config:
+    """DDC matting config reproducing paper P3M-10K portrait matting settings."""
+    return Config(
+        profile="paper_p3m",
+        task_mode="ddc_matting",
+        loss_profile="ddc_matting",
+        model="fast_scnn_salient",
+        optimizer="adamw",
+        learning_rate=5e-4,
+        weight_decay=0.1,
+        scheduler="multistep",
+        scheduler_milestones=[300, 450],
+        scheduler_gamma=0.1,
+        epochs=500,
+        batch_size=16,
+        train_height=512,
+        train_width=512,
+        matting_crop_height=512,
+        matting_crop_width=512,
+        ddc_window_size=11,
+        ddc_num_neighbors=11,
+        ddc_lambda=10.0,
+        lambda_coarse_known=1.0,
+        lambda_fine_known=1.0,
+        amp=True,
+        gradient_clip_enabled=True,
+        gradient_clip_max_norm=1.0,
+        aux=False,
+        early_stopping_enabled=False,
+    )
+
+
+def get_ddc_tv_config() -> Config:
+    """DDC matting config tuned for this project's TV broadcast dataset.
+
+    [PROJECT DECISION] Crop, batch, epoch, and DDC params may differ from paper.
+    """
+    return Config(
+        profile="tv_ddc",
+        task_mode="ddc_matting",
+        loss_profile="ddc_matting",
+        model="fast_scnn_salient",
+        optimizer="adamw",
+        learning_rate=5e-4,
+        weight_decay=0.01,
+        scheduler="poly",
+        poly_power=0.9,
+        epochs=200,
+        batch_size=8,
+        train_height=512,
+        train_width=512,
+        matting_crop_height=512,
+        matting_crop_width=512,
+        ddc_window_size=11,
+        ddc_num_neighbors=11,
+        ddc_lambda=10.0,
+        ddc_chunk_size=4096,
+        lambda_coarse_known=1.0,
+        lambda_fine_known=1.0,
+        amp=True,
+        gradient_clip_enabled=True,
+        gradient_clip_max_norm=1.0,
+        aux=False,
+        early_stopping_enabled=True,
+        early_stopping_patience=30,
     )
