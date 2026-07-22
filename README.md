@@ -676,6 +676,28 @@ python models/fast_scnn_salient.py --device cpu --iterations 5
 
 ---
 
+## Trimap Generation Tool
+
+We provide a utility script [generate_trimap.py](file:///Users/nody/Desktop/fast-SCNN/generate_trimap.py) to automatically convert binary segmentation masks into Trimaps (Background=0, Unknown/Transition=128, Foreground=255) using morphological erosion and dilation.
+
+### Usage
+
+```bash
+# Convert a single mask file
+python generate_trimap.py --input path/to/mask.png --output-dir output_trimaps/ --radius 10
+
+# Batch convert a directory of masks
+python generate_trimap.py --input path/to/masks_dir/ --output-dir output_trimaps/ --radius 12
+
+# Custom distinct erode/dilate radii
+python generate_trimap.py --input mask.png --output-dir output/ --erode-radius 8 --dilate-radius 15
+
+# Output as matting labels (0=BG, 1=Unknown, 2=FG) instead of grayscale (0, 128, 255)
+python generate_trimap.py --input masks_dir/ --output-dir output_labels/ --labels
+```
+
+---
+
 ## Troubleshooting
 
 ### 1920×1080 Training VRAM Issues
