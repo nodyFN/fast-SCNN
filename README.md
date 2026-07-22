@@ -409,8 +409,19 @@ python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP
 
 # Folder inference with Salient model
 python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input data/test/images/ --output-dir results/
+
+# Inference with custom Ground Truth comparison overlay
+python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --gt gt_mask.png --output-dir results/
 ```
-Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), `_prob_gray.png` (grayscale probability mask [0, 255]), and `_overlay.jpg` (colour blend) for each image. It logs model-only latency and end-to-end latency separately.
+Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), `_prob_gray.png` (grayscale probability mask [0, 255]), and `_overlay.jpg` (colour blend) for each image.
+
+### GT Comparison Overlay
+If a Ground Truth mask is provided via `--gt` or automatically discovered (e.g. replacing `images/` directory with `masks/` sibling directory), a `_comparison.jpg` overlay is generated to diagnose segmentation errors using BGR color coding:
+- **Green** (0, 255, 0) : **True Positive (TP)** - prediction matches GT foreground.
+- **Blue** (255, 0, 0) : **False Positive (FP)** - prediction is foreground but GT is background (false alarm).
+- **Red** (0, 0, 255)  : **False Negative (FN)** - prediction is background but GT is foreground (missed area).
+
+It logs model-only latency and end-to-end latency separately.
 
 ---
 

@@ -116,6 +116,82 @@ def create_overlay(
     return overlay
 
 
+def find_gt_mask_path(image_path: Path, gt_arg: Optional[str] = None) -> Optional[Path]:
+    """Find the ground truth mask path for a given image.
+
+    Checks:
+      1. If gt_arg is a direct file path, returns it.
+      2. If gt_arg is a directory, searches for img_name.png/jpg/jpeg inside it.
+      3. Auto-detect: if image_path contains a folder named "images", tries
+         to locate a sibling folder named "masks" with the same base name.
+    """
+    if gt_arg:
+        gt_p = Path(gt_arg)
+        if gt_p.is_file():
+            return gt_p
+        elif gt_p.is_dir():
+            for ext in [".png", ".jpg", ".jpeg"]:
+                candidate = gt_p / f"{image_path.stem}{ext}"
+                if candidate.is_file():
+                    return candidate
+
+    # Auto-detect: replace "/images/" folder with "/masks/"
+    parts = list(image_path.parts)
+    if "images" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("images")
+        parts[idx] = "masks"
+        parent_dir = Path(*parts[:-1])
+        for ext in [".png", ".jpg", ".jpeg"]:
+            candidate = image_path.parents[0].parent / "masks" / f"{image_path.stem}{ext}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def load_gt_mask(gt_path: Path) -> np.ndarray:
+    """Load and normalize GT mask to binary {0, 1}."""
+    mask = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise IOError(f"Failed to read GT mask: {gt_path}")
+    
+    unique = np.unique(mask)
+    if set(unique.tolist()) <= {0, 1}:
+        return mask.astype(np.uint8)
+    if set(unique.tolist()) <= {0, 255}:
+        return (mask // 255).astype(np.uint8)
+    # Fallback to thresholding
+    return (mask > 127).astype(np.uint8)
+
+
+def create_comparison_overlay(
+    image_bgr: np.ndarray,
+    class_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    alpha: float = 0.4,
+) -> np.ndarray:
+    """Create a colored overlay comparing model predictions vs ground truth.
+
+    Color coding (BGR):
+        - Green (0, 255, 0)   : True Positive (TP) - hit (pred=1, gt=1)
+        - Blue (255, 0, 0)    : False Positive (FP) - false alarm (pred=1, gt=0)
+        - Red (0, 0, 255)     : False Negative (FN) - miss (pred=0, gt=1)
+    """
+    overlay = image_bgr.copy()
+    mask_rgb = np.zeros_like(image_bgr)
+
+    tp = (class_mask == 1) & (gt_mask == 1)
+    fp = (class_mask == 1) & (gt_mask == 0)
+    fn = (class_mask == 0) & (gt_mask == 1)
+
+    mask_rgb[tp] = (0, 255, 0)   # Green (True Positive)
+    mask_rgb[fp] = (255, 0, 0)   # Blue (False Positive)
+    mask_rgb[fn] = (0, 0, 255)   # Red (False Negative)
+
+    # Combine with original image using alpha blending
+    overlay = cv2.addWeighted(overlay, 1 - alpha, mask_rgb, alpha, 0)
+    return overlay
+
+
 def infer_single(
     model: torch.nn.Module,
     image_path: Path,
@@ -124,6 +200,7 @@ def infer_single(
     width: int,
     output_dir: Path,
     model_name: str = "fast_scnn",
+    gt_arg: Optional[str] = None,
     use_cuda_sync: bool = False,
 ) -> Dict[str, float]:
     """Run inference on a single image with timing."""
@@ -169,6 +246,24 @@ def infer_single(
     t0 = time.perf_counter()
     results = postprocess(output, original_h, original_w, model_name=model_name)
     overlay = create_overlay(image_bgr, results["class_mask"])
+
+    # Load GT mask if available for comparison
+    gt_mask = None
+    gt_path = find_gt_mask_path(image_path, gt_arg)
+    if gt_path:
+        try:
+            gt_mask_loaded = load_gt_mask(gt_path)
+            if gt_mask_loaded.shape[:2] != (original_h, original_w):
+                gt_mask = cv2.resize(
+                    gt_mask_loaded, (original_w, original_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            else:
+                gt_mask = gt_mask_loaded
+            logger.info(f"Loaded GT mask for comparison: {gt_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load GT mask for comparison: {e}")
+
     if use_cuda_sync:
         torch.cuda.synchronize()
     t1 = time.perf_counter()
@@ -185,6 +280,12 @@ def infer_single(
     cv2.imwrite(str(output_dir / f"{stem}_class.png"), results["class_mask"])
     cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
     cv2.imwrite(str(output_dir / f"{stem}_overlay.jpg"), overlay)
+
+    # If GT mask exists, save the TP/FP/FN comparison overlay
+    if gt_mask is not None:
+        comp_overlay = create_comparison_overlay(image_bgr, results["class_mask"], gt_mask)
+        cv2.imwrite(str(output_dir / f"{stem}_comparison.jpg"), comp_overlay)
+        logger.info(f"Saved comparison overlay to {output_dir / f'{stem}_comparison.jpg'}")
 
     # Probability map as heatmap & grayscale
     prob_vis = (results["fg_probability"] * 255).astype(np.uint8)
@@ -203,6 +304,7 @@ def infer_folder(
     width: int,
     output_dir: Path,
     model_name: str = "fast_scnn",
+    gt_arg: Optional[str] = None,
 ) -> None:
     """Run inference on all images in a folder."""
     images = sorted(
@@ -219,7 +321,8 @@ def infer_folder(
     for img_path in images:
         try:
             timings = infer_single(
-                model, img_path, device, height, width, output_dir, model_name, use_cuda_sync,
+                model, img_path, device, height, width, output_dir,
+                model_name=model_name, gt_arg=gt_arg, use_cuda_sync=use_cuda_sync,
             )
             all_model_ms.append(timings["model_ms"])
             all_e2e_ms.append(timings["e2e_ms"])
@@ -255,6 +358,8 @@ def main() -> None:
                    help="Model architecture of checkpoint (default: fast_scnn)")
     p.add_argument("--input", type=str, required=True,
                    help="Single image path or folder path")
+    p.add_argument("--gt", type=str, default=None,
+                   help="Optional single GT mask path or GT masks directory for comparison overlay")
     p.add_argument("--output-dir", type=str, default="inference_results")
     p.add_argument("--height", type=int, default=512, help="Model input height")
     p.add_argument("--width", type=int, default=1024, help="Model input width")
@@ -289,12 +394,15 @@ def main() -> None:
 
     input_path = Path(args.input)
     if input_path.is_dir():
-        infer_folder(model, input_path, device, args.height, args.width, output_dir, model_name=args.model)
+        infer_folder(
+            model, input_path, device, args.height, args.width, output_dir,
+            model_name=args.model, gt_arg=args.gt,
+        )
     elif input_path.is_file():
         use_cuda_sync = device.type == "cuda"
         timings = infer_single(
             model, input_path, device, args.height, args.width,
-            output_dir, model_name=args.model, use_cuda_sync=use_cuda_sync,
+            output_dir, model_name=args.model, gt_arg=args.gt, use_cuda_sync=use_cuda_sync,
         )
         print(f"\nTiming breakdown:")
         for k, v in timings.items():
