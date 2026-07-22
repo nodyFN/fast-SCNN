@@ -150,7 +150,9 @@ def train_one_epoch(
     running = {}
     num_batches = 0
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+    # Disable progress bar on non-master ranks to avoid output clutter
+    disable_tqdm = (os.environ.get("RANK", "0") != "0")
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=disable_tqdm)
     for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
@@ -215,6 +217,15 @@ def train_one_epoch(
 
     # Average
     avg = {k: v / max(num_batches, 1) for k, v in running.items()}
+
+    # Gather training losses across processes if DDP is active
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        for k in avg:
+            loss_tensor = torch.tensor([avg[k]], device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg[k] = (loss_tensor / dist.get_world_size()).item()
+
     return avg, global_step
 
 
@@ -260,7 +271,17 @@ def validate(
         num_batches += 1
         metrics.update(preds, masks)
 
-    avg_loss = running_loss / max(num_batches, 1)
+    # Gather metrics & loss across DDP processes if active
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        # Reduce average loss
+        loss_tensor = torch.tensor([running_loss / max(num_batches, 1)], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = (loss_tensor / dist.get_world_size()).item()
+    else:
+        avg_loss = running_loss / max(num_batches, 1)
+
+    metrics.all_reduce()
     metric_results = metrics.compute()
     metric_results["val_loss"] = avg_loss
     return metric_results
@@ -400,20 +421,43 @@ def run_smoke_test(cfg: Config) -> None:
 
 def train(cfg: Config) -> None:
     """Full training pipeline."""
-    device = cfg.resolve_device()
-    cfg.ensure_dirs()
+    import os
+    import torch.distributed as dist
+    from torch.utils.data.distributed import DistributedSampler
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    # Detect and initialize DDP environment
+    is_ddp = "RANK" in os.environ
+    if is_ddp:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        # Suppress logging on non-master ranks
+        if rank != 0:
+            logger.setLevel(logging.WARNING)
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        device = cfg.resolve_device()
+
     seed_everything(cfg.seed, cfg.deterministic)
 
-    # Attach FileHandler to save logs to train.log in the active checkpoint folder
-    log_file = cfg.checkpoint_dir / "train.log"
-    file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler.setFormatter(formatter)
-    logging.getLogger().addHandler(file_handler)
+    # Attach FileHandler to save logs to train.log in the active checkpoint folder (Rank 0 only)
+    if rank == 0:
+        cfg.ensure_dirs()
+        log_file = cfg.checkpoint_dir / "train.log"
+        file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(file_handler)
 
     logger.info(f"Device: {device}")
     logger.info(f"Profile: {cfg.profile}")
@@ -429,14 +473,25 @@ def train(cfg: Config) -> None:
     val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform, allow_threshold=cfg.allow_threshold)
     logger.info(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
+    if is_ddp:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        train_shuffle = False
+    else:
+        train_sampler = None
+        val_sampler = None
+        train_shuffle = True
+
     train_loader = build_dataloader(
-        train_ds, cfg.batch_size, shuffle=True,
+        train_ds, cfg.batch_size, shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
         persistent_workers=cfg.persistent_workers, drop_last=True,
         generator_seed=cfg.seed,
     )
     val_loader = build_dataloader(
         val_ds, cfg.batch_size, shuffle=False,
+        sampler=val_sampler,
         num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
         persistent_workers=cfg.persistent_workers,
     )
@@ -478,6 +533,15 @@ def train(cfg: Config) -> None:
         # Recalculate parameters
         total_p, trainable_p = count_parameters(model)
         logger.info(f"Parameters after freezing: total={total_p:,}  trainable={trainable_p:,}")
+
+    # Wrap model with DDP if distributed training is enabled
+    if is_ddp:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     # Optimizer, scheduler, scaler
     optimizer = build_optimizer(model, cfg)
@@ -548,6 +612,8 @@ def train(cfg: Config) -> None:
 
     try:
         for epoch in range(start_epoch, cfg.epochs):
+            if is_ddp:
+                train_sampler.set_epoch(epoch)
             t0 = time.time()
 
             # Train
@@ -601,74 +667,81 @@ def train(cfg: Config) -> None:
                     logger.info(f"  {name}: IoU={val_results['per_class_iou'][i]:.4f}  "
                                 f"Dice={val_results['per_class_dice'][i]:.4f}")
 
-            # History
-            history["train_loss"].append(train_losses["total"])
-            history["val_loss"].append(val_results["val_loss"])
-            history["pixel_accuracy"].append(val_results["pixel_accuracy"])
-            history["miou"].append(val_results["miou"])
-            history["foreground_iou"].append(val_results["foreground_iou"])
-            history["foreground_dice"].append(val_results["foreground_dice"])
-            history["learning_rate"].append(current_lr)
+            # History (Rank 0 only)
+            if rank == 0:
+                history["train_loss"].append(train_losses["total"])
+                history["val_loss"].append(val_results["val_loss"])
+                history["pixel_accuracy"].append(val_results["pixel_accuracy"])
+                history["miou"].append(val_results["miou"])
+                history["foreground_iou"].append(val_results["foreground_iou"])
+                history["foreground_dice"].append(val_results["foreground_dice"])
+                history["learning_rate"].append(current_lr)
 
-            # TensorBoard
-            writer.add_scalar("Loss/train", train_losses["total"], epoch)
-            writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
-            if cfg.model == "fast_scnn_salient":
-                writer.add_scalar("Loss/coarse", train_losses["coarse"], epoch)
-                writer.add_scalar("Loss/fine", train_losses["fine"], epoch)
-                writer.add_scalar("Loss/boundary", train_losses["boundary"], epoch)
-            else:
-                writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
-                writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
-            writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
-            writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
-            writer.add_scalar("Metrics/foreground_iou", val_results["foreground_iou"], epoch)
-            writer.add_scalar("Metrics/foreground_dice", val_results["foreground_dice"], epoch)
-            writer.add_scalar("LearningRate", current_lr, epoch)
+            # TensorBoard (Rank 0 only)
+            if rank == 0 and writer:
+                writer.add_scalar("Loss/train", train_losses["total"], epoch)
+                writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
+                if cfg.model == "fast_scnn_salient":
+                    writer.add_scalar("Loss/coarse", train_losses["coarse"], epoch)
+                    writer.add_scalar("Loss/fine", train_losses["fine"], epoch)
+                    writer.add_scalar("Loss/boundary", train_losses["boundary"], epoch)
+                else:
+                    writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
+                    writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
+                writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
+                writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
+                writer.add_scalar("Metrics/foreground_iou", val_results["foreground_iou"], epoch)
+                writer.add_scalar("Metrics/foreground_dice", val_results["foreground_dice"], epoch)
+                writer.add_scalar("LearningRate", current_lr, epoch)
 
-            # Visualization (save a few samples periodically)
-            if epoch % max(cfg.epochs // 20, 1) == 0 or epoch == cfg.epochs - 1:
-                try:
-                    model.eval()
-                    sample_batch = next(iter(val_loader))
-                    imgs = sample_batch["image"].to(device)
-                    msks = sample_batch["mask"].to(device)
-                    with torch.inference_mode():
-                        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                            preds_outputs = model(imgs)
-                    if cfg.model == "fast_scnn_salient":
-                        preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
-                        probs = preds_outputs["fine_prob"].squeeze(1)
-                    else:
-                        preds = preds_outputs.argmax(dim=1)
-                        probs = torch.softmax(preds_outputs, dim=1)[:, 1]
-                    visualize_segmentation(
-                        imgs, msks, preds, probs,
-                        save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
-                        num_samples=cfg.num_vis_samples,
-                    )
-                except Exception as e:
-                    logger.warning(f"Visualization failed: {e}")
+            # Visualization & Curves (Rank 0 only)
+            if rank == 0:
+                if epoch % max(cfg.epochs // 20, 1) == 0 or epoch == cfg.epochs - 1:
+                    try:
+                        # DDP model forward should use model.module for validation if we unpack it, 
+                        # but standard forward on DDP wrapper also works in eval. Let's use DDP model.
+                        model.eval()
+                        sample_batch = next(iter(val_loader))
+                        imgs = sample_batch["image"].to(device)
+                        msks = sample_batch["mask"].to(device)
+                        with torch.inference_mode():
+                            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                                preds_outputs = model(imgs)
+                        if cfg.model == "fast_scnn_salient":
+                            preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
+                            probs = preds_outputs["fine_prob"].squeeze(1)
+                        else:
+                            preds = preds_outputs.argmax(dim=1)
+                            probs = torch.softmax(preds_outputs, dim=1)[:, 1]
+                        visualize_segmentation(
+                            imgs, msks, preds, probs,
+                            save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
+                            num_samples=cfg.num_vis_samples,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Visualization failed: {e}")
 
-            # Save curves
-            save_all_curves(history, cfg.training_image_dir)
+                # Save curves
+                save_all_curves(history, cfg.training_image_dir)
 
-            # Checkpoints
-            save_checkpoint(
-                cfg.checkpoint_dir / "latest.pt",
-                epoch, global_step, model, optimizer, scheduler, scaler,
-                best_miou, history, asdict(cfg), cfg.class_names,
-                cfg.num_classes, cfg.seed,
-            )
-            if val_results["miou"] > best_miou:
-                best_miou = val_results["miou"]
+            # Checkpoints (Save on Rank 0, but update metrics & early stopping on all ranks to stay synced)
+            if rank == 0:
                 save_checkpoint(
-                    cfg.checkpoint_dir / "best_miou.pt",
+                    cfg.checkpoint_dir / "latest.pt",
                     epoch, global_step, model, optimizer, scheduler, scaler,
                     best_miou, history, asdict(cfg), cfg.class_names,
                     cfg.num_classes, cfg.seed,
                 )
-                logger.info(f"  ★ New best mIoU: {best_miou:.4f}")
+            if val_results["miou"] > best_miou:
+                best_miou = val_results["miou"]
+                if rank == 0:
+                    save_checkpoint(
+                        cfg.checkpoint_dir / "best_miou.pt",
+                        epoch, global_step, model, optimizer, scheduler, scaler,
+                        best_miou, history, asdict(cfg), cfg.class_names,
+                        cfg.num_classes, cfg.seed,
+                    )
+                    logger.info(f"  ★ New best mIoU: {best_miou:.4f}")
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -679,26 +752,33 @@ def train(cfg: Config) -> None:
                 break
 
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt — saving latest checkpoint before exit")
-        save_checkpoint(
-            cfg.checkpoint_dir / "latest.pt",
-            epoch, global_step, model, optimizer, scheduler, scaler,
-            best_miou, history, asdict(cfg), cfg.class_names,
-            cfg.num_classes, cfg.seed,
-        )
+        if rank == 0:
+            logger.info("KeyboardInterrupt — saving latest checkpoint before exit")
+            save_checkpoint(
+                cfg.checkpoint_dir / "latest.pt",
+                epoch, global_step, model, optimizer, scheduler, scaler,
+                best_miou, history, asdict(cfg), cfg.class_names,
+                cfg.num_classes, cfg.seed,
+            )
 
-    # Save history as JSON
-    history_path = cfg.checkpoint_dir / "history.json"
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
-    logger.info(f"Training history saved to {history_path}")
+    # Save history as JSON (Rank 0 only)
+    if rank == 0:
+        history_path = cfg.checkpoint_dir / "history.json"
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        logger.info(f"Training history saved to {history_path}")
 
-    writer.close()
-    logger.info(f"Training complete.  Best mIoU: {best_miou:.4f}")
+        if writer:
+            writer.close()
+        logger.info(f"Training complete.  Best mIoU: {best_miou:.4f}")
 
-    # Flush, close and remove FileHandler
-    file_handler.close()
-    logging.getLogger().removeHandler(file_handler)
+        # Flush, close and remove FileHandler
+        file_handler.close()
+        logging.getLogger().removeHandler(file_handler)
+
+    # Cleanup DDP process group
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 # ===========================================================================

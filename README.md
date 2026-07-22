@@ -340,6 +340,22 @@ python train.py --profile project --data-root data
 python train.py --profile project --data-root duts_data --allow-threshold
 ```
 
+### Multi-GPU DDP Training (Recommended for speed)
+
+To speed up training using multiple GPUs, use PyTorch's `torchrun` launcher. DDP (Distributed Data Parallel) is automatically activated when run under `torchrun`:
+
+```bash
+# Train on DUTS using 4 GPUs (e.g. CUDA devices 0, 1, 2, 3)
+torchrun --nproc_per_node=4 train.py --model fast_scnn_salient --profile project --data-root duts_data --allow-threshold --batch-size 8
+
+# Resume training using 4 GPUs
+torchrun --nproc_per_node=4 train.py --resume checkpoints/TIMESTAMP/latest.pt --epochs 100
+```
+
+> [!NOTE]
+> - **Batch Size**: The `--batch-size` parameter represents the **batch size per GPU** in DDP mode. If you set `--batch-size 8` with 4 GPUs, the global batch size is 32.
+> - **Learning Rate**: We recommend scaling the learning rate linearly (e.g. `--lr 0.004` if you scale up to 4 GPUs from single-GPU `--lr 0.001`).
+
 ### Focal Loss Tuning
 You can enable and adjust the weight of Focal Loss in the combined loss function by modifying `focal_weight` in `config.py` (specifically under the active profile's configuration function, such as `get_project_config()`):
 ```python

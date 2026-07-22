@@ -262,6 +262,7 @@ def build_dataloader(
     dataset: Dataset,
     batch_size: int = 4,
     shuffle: bool = True,
+    sampler: Optional[torch.utils.data.Sampler] = None,
     num_workers: int = 4,
     pin_memory: bool = True,
     persistent_workers: bool = True,
@@ -280,6 +281,9 @@ def build_dataloader(
     if num_workers == 0:
         persistent_workers = False
 
+    if sampler is not None:
+        shuffle = False
+
     generator = None
     if generator_seed is not None:
         generator = torch.Generator()
@@ -289,6 +293,7 @@ def build_dataloader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,

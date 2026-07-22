@@ -73,6 +73,16 @@ class SegmentationMetrics:
         cm_flat = torch.bincount(indices, minlength=self.num_classes ** 2)
         self.confusion_matrix += cm_flat.reshape(self.num_classes, self.num_classes)
 
+    def all_reduce(self) -> None:
+        """Sum the confusion matrix across all DDP processes in place."""
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            # Get active device
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            cm_gpu = self.confusion_matrix.to(device)
+            dist.all_reduce(cm_gpu, op=dist.ReduceOp.SUM)
+            self.confusion_matrix = cm_gpu.cpu()
+
     def compute(self) -> Dict[str, object]:
         """Compute all metrics from the accumulated confusion matrix.
 
