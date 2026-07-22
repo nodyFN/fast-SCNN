@@ -404,6 +404,17 @@ def train(cfg: Config) -> None:
     cfg.ensure_dirs()
     seed_everything(cfg.seed, cfg.deterministic)
 
+    # Attach FileHandler to save logs to train.log in the active checkpoint folder
+    log_file = cfg.checkpoint_dir / "train.log"
+    file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(file_handler)
+
     logger.info(f"Device: {device}")
     logger.info(f"Profile: {cfg.profile}")
     logger.info(f"AMP: {cfg.amp and device.type == 'cuda'}")
@@ -684,6 +695,10 @@ def train(cfg: Config) -> None:
 
     writer.close()
     logger.info(f"Training complete.  Best mIoU: {best_miou:.4f}")
+
+    # Flush, close and remove FileHandler
+    file_handler.close()
+    logging.getLogger().removeHandler(file_handler)
 
 
 # ===========================================================================
