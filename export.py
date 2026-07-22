@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from config import Config
-from models.fast_scnn import FastSCNN
+from models import FastSCNN, FastSCNNSalient
 from utils.checkpoint import load_checkpoint
 
 logging.basicConfig(
@@ -43,15 +43,18 @@ class FastSCNNExportWrapper(torch.nn.Module):
     This wrapper always returns a single tensor.
     """
 
-    def __init__(self, model: FastSCNN) -> None:
+    def __init__(self, model: torch.nn.Module, model_name: str = "fast_scnn") -> None:
         super().__init__()
         self.model = model
+        self.model_name = model_name
         # Force eval mode for export
         self.model.eval()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.model(x)
-        if isinstance(out, dict):
+        if self.model_name == "fast_scnn_salient" or isinstance(out, dict):
+            if "fine_logits" in out:
+                return out["fine_logits"]
             return out["out"]
         return out
 
@@ -59,6 +62,7 @@ class FastSCNNExportWrapper(torch.nn.Module):
 def export_onnx(
     checkpoint_path: str,
     output_path: str,
+    model_name: str = "fast_scnn",
     height: int = 512,
     width: int = 1024,
     opset: int = 17,
@@ -75,14 +79,25 @@ def export_onnx(
 
     device = torch.device(device_str)
 
+    # Config to access defaults
+    cfg = Config()
+
     # Build model (aux=True to load all weights, then wrap for export)
-    model = FastSCNN(num_classes=num_classes, aux=True).to(device)
+    if model_name == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(num_classes=num_classes, aux=True).to(device)
 
     if checkpoint_path:
         load_checkpoint(checkpoint_path, model, map_location=device, weights_only=True)
         logger.info(f"Loaded checkpoint: {checkpoint_path}")
 
-    wrapper = FastSCNNExportWrapper(model)
+    wrapper = FastSCNNExportWrapper(model, model_name=model_name)
     wrapper.eval()
 
     dummy_input = torch.randn(1, 3, height, width, device=device)
@@ -118,6 +133,7 @@ def export_onnx(
 
 def validate_onnx(
     onnx_path: Path,
+    model_name: str = "fast_scnn",
     height: int = 512,
     width: int = 1024,
     num_classes: int = 2,
@@ -154,7 +170,18 @@ def validate_onnx(
 
     # --- Numerical comparison ---
     device = torch.device(device_str if device_str != "cuda" or torch.cuda.is_available() else "cpu")
-    model = FastSCNN(num_classes=num_classes, aux=True).to(device)
+    
+    cfg = Config()
+    if model_name == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(num_classes=num_classes, aux=True).to(device)
+
     if checkpoint_path:
         load_checkpoint(checkpoint_path, model, map_location=device, weights_only=True)
     model.eval()
@@ -174,7 +201,10 @@ def validate_onnx(
         with torch.inference_mode():
             pt_out = model(dummy)
         if isinstance(pt_out, dict):
-            pt_out = pt_out["out"]
+            if "fine_logits" in pt_out:
+                pt_out = pt_out["fine_logits"]
+            else:
+                pt_out = pt_out["out"]
         pt_np = pt_out.cpu().numpy()
 
         # ORT
@@ -235,8 +265,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Export Fast-SCNN to ONNX")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Path to checkpoint (None = random weights)")
+    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default="fast_scnn",
+                   help="Model architecture to export (default: fast_scnn)")
     p.add_argument("--output", type=str, default=None,
-                   help="Output ONNX path (default: exports/fast_scnn.onnx)")
+                   help="Output ONNX path (default: exports/{model}{suffix}.onnx)")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--opset", type=int, default=17,
@@ -255,11 +287,12 @@ def main() -> None:
 
     if args.output is None:
         suffix = "_dynamic" if args.dynamic else f"_{args.height}x{args.width}"
-        args.output = str(cfg.export_dir / f"fast_scnn{suffix}.onnx")
+        args.output = str(cfg.export_dir / f"{args.model}{suffix}.onnx")
 
     onnx_path = export_onnx(
         checkpoint_path=args.checkpoint,
         output_path=args.output,
+        model_name=args.model,
         height=args.height,
         width=args.width,
         opset=args.opset,
@@ -271,6 +304,7 @@ def main() -> None:
     if not args.no_validate:
         ok = validate_onnx(
             onnx_path,
+            model_name=args.model,
             height=args.height,
             width=args.width,
             num_classes=args.num_classes,

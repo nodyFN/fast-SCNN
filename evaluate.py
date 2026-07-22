@@ -20,9 +20,9 @@ from tqdm import tqdm
 
 from config import Config
 from dataset import SegmentationDataset, build_dataloader, build_val_transform
-from models.fast_scnn import FastSCNN
+from models import FastSCNN, FastSCNNSalient
 from utils.checkpoint import load_checkpoint
-from utils.losses import CombinedSegmentationLoss, compute_total_loss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss
 from utils.metrics import SegmentationMetrics
 from utils.visualization import visualize_segmentation
 
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 def evaluate(
     checkpoint_path: str,
+    model_name: str = "fast_scnn",
     split: str = "val",
     data_root: str | None = None,
     batch_size: int = 4,
@@ -49,6 +50,7 @@ def evaluate(
     allow_threshold: bool = False,
 ) -> None:
     cfg = Config()
+    cfg.model = model_name
     if data_root:
         cfg.data_root = Path(data_root)
         cfg.train_dir = cfg.data_root / "train"
@@ -76,18 +78,41 @@ def evaluate(
     )
 
     # Model
-    model = FastSCNN(num_classes=cfg.num_classes, aux=True).to(device)
+    if cfg.model == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(num_classes=cfg.num_classes, aux=True).to(device)
     ckpt = load_checkpoint(checkpoint_path, model, map_location=device, weights_only=True)
     logger.info(f"Loaded checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch', '?')})")
 
     model.eval()
 
     # Loss & Metrics
-    criterion = CombinedSegmentationLoss(
-        ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
-        ignore_index=cfg.ignore_index,
-    )
-    metrics_obj = SegmentationMetrics(cfg.num_classes, cfg.ignore_index)
+    if cfg.model == "fast_scnn_salient":
+        criterion = SalientSegmentationLoss(
+            lambda_coarse=cfg.salient_lambda_coarse,
+            lambda_fine=cfg.salient_lambda_fine,
+            lambda_boundary=cfg.salient_lambda_boundary,
+            coarse_bce_weight=cfg.salient_coarse_bce_weight,
+            coarse_dice_weight=cfg.salient_coarse_dice_weight,
+            fine_focal_weight=cfg.salient_fine_focal_weight,
+            fine_dice_weight=cfg.salient_fine_dice_weight,
+            focal_alpha=cfg.salient_focal_alpha,
+            focal_gamma=cfg.salient_focal_gamma,
+            pos_weight=cfg.salient_pos_weight,
+        ).to(device)
+        metrics_obj = SegmentationMetrics(2, cfg.ignore_index)
+    else:
+        criterion = CombinedSegmentationLoss(
+            ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
+            ignore_index=cfg.ignore_index,
+        ).to(device)
+        metrics_obj = SegmentationMetrics(cfg.num_classes, cfg.ignore_index)
 
     total_loss = 0.0
     num_batches = 0
@@ -99,17 +124,32 @@ def evaluate(
             masks = batch["mask"].to(device, non_blocking=True)
 
             logits = model(images)
-            loss_dict = compute_total_loss(criterion, logits, masks, 0.0, 0.0)
+            if cfg.model == "fast_scnn_salient":
+                targets = masks.unsqueeze(1).float()
+                loss_dict = criterion(
+                    coarse_logits=logits["coarse_logits"],
+                    fine_logits=logits["fine_logits"],
+                    targets=targets,
+                )
+                preds = (logits["fine_logits"] > 0.0).squeeze(1).long()
+            else:
+                loss_dict = compute_total_loss(criterion, logits, masks, 0.0, 0.0)
+                preds = logits
+
             total_loss += loss_dict["total"].item()
             num_batches += 1
-            metrics_obj.update(logits, masks)
+            metrics_obj.update(preds, masks)
 
             # Save visualization for first batch
             if save_vis and not vis_saved:
-                preds = logits.argmax(dim=1)
-                probs = torch.softmax(logits, dim=1)[:, 1]
+                if cfg.model == "fast_scnn_salient":
+                    preds_vis = (logits["fine_logits"] > 0.0).squeeze(1).long()
+                    probs_vis = logits["fine_prob"].squeeze(1)
+                else:
+                    preds_vis = logits.argmax(dim=1)
+                    probs_vis = torch.softmax(logits, dim=1)[:, 1]
                 visualize_segmentation(
-                    images, masks, preds, probs,
+                    images, masks, preds_vis, probs_vis,
                     save_path=output_path / f"{split}_visualization.png",
                     num_samples=min(num_vis_samples, images.shape[0]),
                 )
@@ -129,7 +169,8 @@ def evaluate(
     print(f"  Foreground IoU  : {results['foreground_iou']:.4f}")
     print(f"  Foreground Dice : {results['foreground_dice']:.4f}")
     print(f"  Mean Dice       : {results['mean_dice']:.4f}")
-    for i, name in enumerate(cfg.class_names):
+    class_names = ["background", "foreground"] if cfg.model == "fast_scnn_salient" else cfg.class_names
+    for i, name in enumerate(class_names):
         print(f"  {name:15s} : IoU={results['per_class_iou'][i]:.4f}  "
               f"Dice={results['per_class_dice'][i]:.4f}")
     print(f"\nConfusion Matrix:")
@@ -157,6 +198,8 @@ def evaluate(
 def main() -> None:
     p = argparse.ArgumentParser(description="Evaluate Fast-SCNN")
     p.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default="fast_scnn",
+                   help="Model architecture of checkpoint (default: fast_scnn)")
     p.add_argument("--split", choices=["val", "test"], default="val")
     p.add_argument("--data-root", type=str, default=None)
     p.add_argument("--batch-size", type=int, default=4)
@@ -173,6 +216,7 @@ def main() -> None:
 
     evaluate(
         checkpoint_path=args.checkpoint,
+        model_name=args.model,
         split=args.split,
         data_root=args.data_root,
         batch_size=args.batch_size,

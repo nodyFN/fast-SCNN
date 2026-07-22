@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from config import Config
 from dataset import IMAGENET_MEAN, IMAGENET_STD
-from models.fast_scnn import FastSCNN
+from models import FastSCNN, FastSCNNSalient
 from utils.checkpoint import load_checkpoint
 
 logging.basicConfig(
@@ -61,19 +61,38 @@ def preprocess(
 
 
 def postprocess(
-    logits: torch.Tensor,
+    output: torch.Tensor | Dict[str, torch.Tensor],
     original_h: int,
     original_w: int,
+    model_name: str = "fast_scnn",
 ) -> Dict[str, np.ndarray]:
     """Convert model output to prediction maps at original resolution."""
-    # Upsample to original size
-    logits_up = F.interpolate(
-        logits, size=(original_h, original_w),
-        mode="bilinear", align_corners=False,
-    )
-    probs = torch.softmax(logits_up, dim=1)
-    pred_class = logits_up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-    prob_fg = probs[0, 1].cpu().numpy()
+    if model_name == "fast_scnn_salient" or isinstance(output, dict):
+        fine_logits = output["fine_logits"]
+        fine_prob = output["fine_prob"]
+        
+        # Upsample both to original size
+        logits_up = F.interpolate(
+            fine_logits, size=(original_h, original_w),
+            mode="bilinear", align_corners=False,
+        )
+        prob_up = F.interpolate(
+            fine_prob, size=(original_h, original_w),
+            mode="bilinear", align_corners=False,
+        )
+        
+        pred_class = (logits_up > 0.0).squeeze(0).squeeze(0).cpu().numpy().astype(np.uint8)
+        prob_fg = prob_up.squeeze(0).squeeze(0).cpu().numpy()
+    else:
+        # Upsample to original size
+        logits_up = F.interpolate(
+            output, size=(original_h, original_w),
+            mode="bilinear", align_corners=False,
+        )
+        probs = torch.softmax(logits_up, dim=1)
+        pred_class = logits_up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+        prob_fg = probs[0, 1].cpu().numpy()
+        
     mask_255 = (pred_class * 255).astype(np.uint8)
 
     return {
@@ -104,6 +123,7 @@ def infer_single(
     height: int,
     width: int,
     output_dir: Path,
+    model_name: str = "fast_scnn",
     use_cuda_sync: bool = False,
 ) -> Dict[str, float]:
     """Run inference on a single image with timing."""
@@ -137,7 +157,7 @@ def infer_single(
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.inference_mode():
-        logits = model(tensor)
+        output = model(tensor)
     if use_cuda_sync:
         torch.cuda.synchronize()
     t1 = time.perf_counter()
@@ -147,7 +167,7 @@ def infer_single(
     if use_cuda_sync:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    results = postprocess(logits, original_h, original_w)
+    results = postprocess(output, original_h, original_w, model_name=model_name)
     overlay = create_overlay(image_bgr, results["class_mask"])
     if use_cuda_sync:
         torch.cuda.synchronize()
@@ -182,6 +202,7 @@ def infer_folder(
     height: int,
     width: int,
     output_dir: Path,
+    model_name: str = "fast_scnn",
 ) -> None:
     """Run inference on all images in a folder."""
     images = sorted(
@@ -198,7 +219,7 @@ def infer_folder(
     for img_path in images:
         try:
             timings = infer_single(
-                model, img_path, device, height, width, output_dir, use_cuda_sync,
+                model, img_path, device, height, width, output_dir, model_name, use_cuda_sync,
             )
             all_model_ms.append(timings["model_ms"])
             all_e2e_ms.append(timings["e2e_ms"])
@@ -230,6 +251,8 @@ def infer_folder(
 def main() -> None:
     p = argparse.ArgumentParser(description="Fast-SCNN Inference")
     p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default="fast_scnn",
+                   help="Model architecture of checkpoint (default: fast_scnn)")
     p.add_argument("--input", type=str, required=True,
                    help="Single image path or folder path")
     p.add_argument("--output-dir", type=str, default="inference_results")
@@ -246,20 +269,32 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
 
+    # Config to access defaults if needed
+    cfg = Config()
+
     # Model
-    model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)
+    if args.model == "fast_scnn_salient":
+        model = FastSCNNSalient(
+            ppm_pool_sizes=cfg.ppm_pool_sizes,
+            coarse_channels=cfg.coarse_channels,
+            refinement_channels=cfg.refinement_channels,
+            dropout_p=cfg.dropout_p,
+        ).to(device)
+    else:
+        model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)
+        
     load_checkpoint(args.checkpoint, model, map_location=device, weights_only=True)
     model.eval()
-    logger.info(f"Model loaded on {device}")
+    logger.info(f"Model ({args.model}) loaded on {device}")
 
     input_path = Path(args.input)
     if input_path.is_dir():
-        infer_folder(model, input_path, device, args.height, args.width, output_dir)
+        infer_folder(model, input_path, device, args.height, args.width, output_dir, model_name=args.model)
     elif input_path.is_file():
         use_cuda_sync = device.type == "cuda"
         timings = infer_single(
             model, input_path, device, args.height, args.width,
-            output_dir, use_cuda_sync,
+            output_dir, model_name=args.model, use_cuda_sync=use_cuda_sync,
         )
         print(f"\nTiming breakdown:")
         for k, v in timings.items():
