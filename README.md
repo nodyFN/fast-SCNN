@@ -381,28 +381,34 @@ python train.py --smoke-test
 
 ## Evaluation
 
-Evaluate a saved checkpoint against the validation or test split of your dataset:
+Evaluate a saved checkpoint against the validation or test split of your dataset. Choose the model type matching your checkpoint with the `--model` parameter:
 
 ```bash
-# Evaluate on custom validation split
+# Evaluate standard Fast-SCNN
 python evaluate.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split val --data-root data
 
-# Evaluate on DUTS test split with visual output (requires --allow-threshold)
-python evaluate.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split test --data-root duts_data --allow-threshold --save-vis
+# Evaluate Fast-SCNN Salient
+python evaluate.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split val --data-root data
+
+# Evaluate Salient model on DUTS test split with visual output (requires --allow-threshold)
+python evaluate.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --split test --data-root duts_data --allow-threshold --save-vis
 ```
 
 ---
 
 ## Inference
 
-Run inference on a single image or a folder of images. Preprocessing automatically resizes the image to the model input dimensions, and postprocessing upsamples the prediction mask back to the original image dimensions.
+Run inference on a single image or a folder of images. Choose the model type matching your checkpoint with the `--model` parameter:
 
 ```bash
-# Single image
+# Inference with standard Fast-SCNN
 python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --output-dir results/
 
-# Folder of images
-python inference.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input data/test/images/ --output-dir results/
+# Inference with Fast-SCNN Salient
+python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --output-dir results/
+
+# Folder inference with Salient model
+python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input data/test/images/ --output-dir results/
 ```
 Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), `_prob_gray.png` (grayscale probability mask [0, 255]), and `_overlay.jpg` (colour blend) for each image. It logs model-only latency and end-to-end latency separately.
 
@@ -410,14 +416,16 @@ Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (salien
 
 ## ONNX Export
 
+Export the model to ONNX. Choose the model type matching your checkpoint with the `--model` parameter:
+
 ### Fixed-size export
 ```bash
-python export.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024
+python export.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024
 ```
 
 ### Dynamic axes export (Recommended for varying resolutions)
 ```bash
-python export.py --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024 --dynamic
+python export.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --height 512 --width 1024 --dynamic
 ```
 
 After export, ONNX Runtime validation runs automatically: checking the model structure, output shape, and numerical deviation vs PyTorch. Dynamic exports are tested at multiple input resolutions.
