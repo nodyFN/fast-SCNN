@@ -44,11 +44,29 @@ SUFFIX_MAP = {
 }
 
 
+# In-memory scan cache
+_cached_groups: List[Dict] = []
+_cached_mtime: float = 0.0
+
+
 def scan_inference_directory(dir_path: Path) -> List[Dict]:
-    """Scan directory and group generated files by image stem."""
+    """Scan directory and group generated files by image stem.
+    
+    Uses in-memory cache to avoid disk scanning if the directory mtime is unchanged.
+    """
+    global _cached_groups, _cached_mtime
     if not dir_path.exists():
         logger.warning(f"Directory does not exist: {dir_path}")
         return []
+
+    # Check modification time to see if we can use cached results
+    try:
+        current_mtime = dir_path.stat().st_mtime
+    except Exception:
+        current_mtime = 0.0
+
+    if _cached_groups and current_mtime == _cached_mtime:
+        return _cached_groups
 
     # Find all files
     files = sorted(list(dir_path.iterdir()))
@@ -92,6 +110,9 @@ def scan_inference_directory(dir_path: Path) -> List[Dict]:
             "stem": stem,
             "files": file_list
         })
+        
+    _cached_groups = result
+    _cached_mtime = current_mtime
     return result
 
 
@@ -590,6 +611,19 @@ def create_handler(results_dir: Path):
             });
         }
 
+        function prefetchNext() {
+            const nextIdx = currentIndex + 1;
+            if (nextIdx < groups.length) {
+                const nextGroup = groups[nextIdx];
+                Object.keys(MAP_DEFS).forEach(k => {
+                    if (displayConfigs[k] && nextGroup.files[k]) {
+                        const img = new Image();
+                        img.src = "/" + nextGroup.files[k];
+                    }
+                });
+            }
+        }
+
         function selectIndex(idx) {
             if (idx < 0 || idx >= groups.length) return;
             currentIndex = idx;
@@ -605,6 +639,9 @@ def create_handler(results_dir: Path):
             document.getElementById('currentGroupMeta').textContent = `Image ${idx + 1} of ${groups.length}`;
             
             renderImages();
+            
+            // Background prefetch next group
+            prefetchNext();
         }
 
         function selectGroup(val) {
@@ -698,6 +735,11 @@ def create_handler(results_dir: Path):
     return ResultsViewerHandler
 
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Multi-threaded HTTP Server for handling concurrent image downloads."""
+    daemon_threads = True
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Start Web Results Viewer")
     p.add_argument("--dir", type=str, default="inference_results",
@@ -717,12 +759,12 @@ def main() -> None:
     handler = create_handler(results_dir)
     
     # Allow address reuse to prevent "Address already in use" errors during rapid restarts
-    socketserver.TCPServer.allow_reuse_address = True
+    ThreadingHTTPServer.allow_reuse_address = True
     
     try:
-        with socketserver.TCPServer(("", args.port), handler) as httpd:
+        with ThreadingHTTPServer(("", args.port), handler) as httpd:
             url = f"http://localhost:{args.port}"
-            logger.info(f"Starting server at {url}")
+            logger.info(f"Starting concurrent server at {url}")
             logger.info("Press Ctrl+C to stop.")
             
             # Auto-open browser
