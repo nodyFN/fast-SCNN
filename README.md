@@ -481,6 +481,29 @@ Once started, the tool automatically opens your default browser at `http://local
 
 ---
 
+## Desktop GUI Viewer (Offline & Infinite Speed)
+
+If you have unstable internet, loading web fonts is slow, or you prefer a **native windowed application**, you can run the offline desktop visualizer. It is built using Python's standard `tkinter` library and `Pillow`. It requires **no local network port or web browser**.
+
+### Run Desktop Viewer
+```bash
+# Default folder (inference_results/)
+python gui_viewer.py
+
+# Custom inference folder
+python gui_viewer.py --dir results/
+```
+
+### UI Controls
+- **Active Layers (Toggles)**: Toggle checkbuttons at the top to choose which maps appear in the grid.
+- **Auto-Scaling Layout**: Drag the window corners to resize. The images automatically scale to fit the grid perfectly with aspect-ratio locked.
+- **Navigation Shortcuts**:
+  - Click **Prev** / **Next** buttons, or use the Combobox to pick files directly.
+  - Press Keyboard **Left Arrow (`←`)** / **Right Arrow (`→`)** to switch pages.
+  - Press **Esc** to close the window.
+
+---
+
 ## TensorBoard
 
 Visualize loss curves, auxiliary losses, metric scores (PA, mIoU, Foreground IoU, Foreground Dice), and learning rate changes:
