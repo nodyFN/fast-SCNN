@@ -187,7 +187,6 @@ def train_one_epoch(
             logger.error(f"Non-finite loss detected at step {global_step}: {total_loss.item()}")
             raise RuntimeError(f"Training diverged (loss={total_loss.item()}) at step {global_step}")
 
-        step_before = optimizer._step_count
         if scaler is not None:
             scaler.scale(total_loss).backward()
             if cfg.gradient_clip_enabled:
@@ -201,9 +200,11 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_max_norm)
             optimizer.step()
 
-        # Step iteration-based scheduler (PolyLR) only if optimizer actually stepped
+        # Step iteration-based scheduler (PolyLR)
         if cfg.scheduler.lower() == "poly":
-            if optimizer._step_count > step_before:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, message="Detected call of.*")
                 scheduler.step()
 
         global_step += 1
@@ -630,7 +631,10 @@ def train(cfg: Config) -> None:
 
             # Epoch-based scheduler step (CosineAnnealing)
             if cfg.scheduler.lower() == "cosine":
-                scheduler.step()
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning, message="Detected call of.*")
+                    scheduler.step()
 
             # Validate
             val_results = validate(model, val_loader, criterion, device, metrics_obj, cfg, use_amp)
