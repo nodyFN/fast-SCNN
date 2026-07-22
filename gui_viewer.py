@@ -36,6 +36,8 @@ except ImportError:
 
 # File suffixes definitions and descriptive display names
 SUFFIX_MAP = {
+    "_input.jpg": "Original Input",
+    "_input.png": "Original Input",
     "_overlay.jpg": "Prediction Overlay",
     "_comparison.jpg": "Error Diagnostic (TP/FP/FN)",
     "_prob.jpg": "Saliency Heatmap",
@@ -140,7 +142,10 @@ class DiagnosticsViewerApp:
 
         # Checkbutton state variables
         self.toggles: Dict[str, tk.BooleanVar] = {}
-        defaults = {"overlay_jpg": True, "comparison_jpg": True, "prob_jpg": True}
+        defaults = {
+            "input_jpg": True, "input_png": True,
+            "overlay_jpg": True, "comparison_jpg": True, "prob_jpg": True
+        }
         
         for k, display_name in SUFFIX_MAP.items():
             key = k.lstrip("_").replace(".", "_")

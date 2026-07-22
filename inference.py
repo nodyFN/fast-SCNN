@@ -394,6 +394,7 @@ def infer_single(
     # --- Save outputs ---
     stem = image_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_dir / f"{stem}_input.jpg"), image_bgr)
     cv2.imwrite(str(output_dir / f"{stem}_class.png"), results["class_mask"])
     cv2.imwrite(str(output_dir / f"{stem}_binary.png"), results["binary_mask"])
     cv2.imwrite(str(output_dir / f"{stem}_overlay.jpg"), overlay)

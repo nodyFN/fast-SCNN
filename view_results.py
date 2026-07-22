@@ -34,6 +34,8 @@ PORT = 8000
 
 # Mapping of file suffixes to descriptive display names
 SUFFIX_MAP = {
+    "_input.jpg": "Original Input",
+    "_input.png": "Original Input",
     "_overlay.jpg": "Prediction Overlay",
     "_comparison.jpg": "Error Diagnostic (TP/FP/FN)",
     "_prob.jpg": "Saliency Heatmap",
@@ -523,6 +525,8 @@ def create_handler(results_dir: Path):
         
         // Dictionary of maps with corresponding suffix key and display titles
         const MAP_DEFS = {
+            "input_jpg": { name: "Original Input", default: true },
+            "input_png": { name: "Original Input", default: true },
             "overlay_jpg": { name: "Prediction Overlay", default: true },
             "comparison_jpg": { name: "Error Diagnostic (TP/FP/FN)", default: true },
             "prob_jpg": { name: "Saliency Heatmap", default: true },
