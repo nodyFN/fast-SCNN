@@ -456,6 +456,31 @@ After export, ONNX Runtime validation runs automatically: checking the model str
 
 ---
 
+## Web Results Viewer
+
+A zero-dependency local web visualizer to browse and debug segmentation/saliency outputs side-by-side.
+
+It scans your inference output folder, groups different output images (`overlay`, `comparison`, `heatmap`, `masks`) belonging to the same image stem, and serves a sleek dark-mode SPA dashboard.
+
+### Run Web Viewer
+```bash
+# Default folder (inference_results/)
+python view_results.py
+
+# Custom inference folder
+python view_results.py --dir results/
+```
+Once started, the tool automatically opens your default browser at `http://localhost:8000`.
+
+### UI Controls
+- **Toggles (Active Layers)**: Select which generated maps to display side-by-side. Layout columns adjust dynamically.
+- **Image Navigation**:
+  - Click **Prev** / **Next** buttons or use the dropdown to cycle groups.
+  - Press Keyboard **Left Arrow (`←`)** / **Right Arrow (`→`)** for ultra-fast browsing.
+- **Detail View**: Click any image to view in a fullscreen overlay. Press **Esc** or click background to exit.
+
+---
+
 ## TensorBoard
 
 Visualize loss curves, auxiliary losses, metric scores (PA, mIoU, Foreground IoU, Foreground Dice), and learning rate changes:
