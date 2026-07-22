@@ -192,6 +192,65 @@ def create_comparison_overlay(
     return overlay
 
 
+def draw_label(img: np.ndarray, text: str) -> np.ndarray:
+    """Draw a dark background rectangle and a text label on the top-left of the image."""
+    labeled = img.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(img.shape[1] / 1000.0, 1.2)  # Dynamically scale font based on image width
+    scale = max(scale, 0.6)
+    thickness = 2
+    text_color = (255, 255, 255)  # White
+    bg_color = (0, 0, 0)          # Black
+
+    # Get text dimensions
+    (w, h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    # Draw background box
+    cv2.rectangle(labeled, (10, 10), (10 + w + 15, 10 + h + 15), bg_color, -1)
+    # Draw text
+    cv2.putText(labeled, text, (17, 10 + h + 7), font, scale, text_color, thickness, cv2.LINE_AA)
+    return labeled
+
+
+def create_combined_image(
+    image_bgr: np.ndarray,
+    binary_mask: np.ndarray,
+    overlay: np.ndarray,
+    prob_color: np.ndarray,
+    comparison: Optional[np.ndarray],
+    keys: list[str],
+) -> Optional[np.ndarray]:
+    """Concatenate selected outputs horizontally with labels.
+
+    Supported keys: 'input', 'mask', 'overlay', 'prob', 'comparison'
+    """
+    images = []
+    for k in keys:
+        k = k.lower().strip()
+        if k == "input":
+            labeled = draw_label(image_bgr, "Input Image")
+            images.append(labeled)
+        elif k == "mask":
+            mask_bgr = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+            labeled = draw_label(mask_bgr, "Binary Mask")
+            images.append(labeled)
+        elif k == "overlay":
+            labeled = draw_label(overlay, "Prediction Overlay")
+            images.append(labeled)
+        elif k == "prob":
+            labeled = draw_label(prob_color, "Saliency Heatmap")
+            images.append(labeled)
+        elif k == "comparison":
+            if comparison is not None:
+                labeled = draw_label(comparison, "Error Diagnostic (TP/FP/FN)")
+                images.append(labeled)
+            else:
+                logger.warning("Comparison requested in merge but Ground Truth is not available.")
+    
+    if not images:
+        return None
+    return np.hstack(images)
+
+
 def infer_single(
     model: torch.nn.Module,
     image_path: Path,
@@ -201,6 +260,7 @@ def infer_single(
     output_dir: Path,
     model_name: str = "fast_scnn",
     gt_arg: Optional[str] = None,
+    merge_arg: Optional[str] = None,
     use_cuda_sync: bool = False,
 ) -> Dict[str, float]:
     """Run inference on a single image with timing."""
@@ -249,6 +309,7 @@ def infer_single(
 
     # Load GT mask if available for comparison
     gt_mask = None
+    comp_overlay = None
     gt_path = find_gt_mask_path(image_path, gt_arg)
     if gt_path:
         try:
@@ -293,6 +354,17 @@ def infer_single(
     cv2.imwrite(str(output_dir / f"{stem}_prob.jpg"), prob_color)
     cv2.imwrite(str(output_dir / f"{stem}_prob_gray.png"), prob_vis)
 
+    # Concatenate specified maps to single unified image
+    if merge_arg:
+        merge_keys = [k.strip() for k in merge_arg.split(",") if k.strip()]
+        combined_img = create_combined_image(
+            image_bgr, results["binary_mask"], overlay,
+            prob_color, comp_overlay, merge_keys,
+        )
+        if combined_img is not None:
+            cv2.imwrite(str(output_dir / f"{stem}_merged.jpg"), combined_img)
+            logger.info(f"Saved merged output collage to {output_dir / f'{stem}_merged.jpg'}")
+
     return timings
 
 
@@ -305,6 +377,7 @@ def infer_folder(
     output_dir: Path,
     model_name: str = "fast_scnn",
     gt_arg: Optional[str] = None,
+    merge_arg: Optional[str] = None,
 ) -> None:
     """Run inference on all images in a folder."""
     images = sorted(
@@ -322,7 +395,7 @@ def infer_folder(
         try:
             timings = infer_single(
                 model, img_path, device, height, width, output_dir,
-                model_name=model_name, gt_arg=gt_arg, use_cuda_sync=use_cuda_sync,
+                model_name=model_name, gt_arg=gt_arg, merge_arg=merge_arg, use_cuda_sync=use_cuda_sync,
             )
             all_model_ms.append(timings["model_ms"])
             all_e2e_ms.append(timings["e2e_ms"])
@@ -360,6 +433,8 @@ def main() -> None:
                    help="Single image path or folder path")
     p.add_argument("--gt", type=str, default=None,
                    help="Optional single GT mask path or GT masks directory for comparison overlay")
+    p.add_argument("--merge", type=str, default=None,
+                   help="Optional comma-separated list of outputs to merge horizontally. Choices: input, mask, overlay, prob, comparison")
     p.add_argument("--output-dir", type=str, default="inference_results")
     p.add_argument("--height", type=int, default=512, help="Model input height")
     p.add_argument("--width", type=int, default=1024, help="Model input width")
@@ -396,13 +471,14 @@ def main() -> None:
     if input_path.is_dir():
         infer_folder(
             model, input_path, device, args.height, args.width, output_dir,
-            model_name=args.model, gt_arg=args.gt,
+            model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
         )
     elif input_path.is_file():
         use_cuda_sync = device.type == "cuda"
         timings = infer_single(
             model, input_path, device, args.height, args.width,
-            output_dir, model_name=args.model, gt_arg=args.gt, use_cuda_sync=use_cuda_sync,
+            output_dir, model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
+            use_cuda_sync=use_cuda_sync,
         )
         print(f"\nTiming breakdown:")
         for k, v in timings.items():

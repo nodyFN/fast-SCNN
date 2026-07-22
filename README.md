@@ -412,6 +412,9 @@ python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP
 
 # Inference with custom Ground Truth comparison overlay
 python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --gt gt_mask.png --output-dir results/
+
+# Inference and save merged collage of outputs
+python inference.py --model fast_scnn_salient --checkpoint checkpoints/TIMESTAMP/best_miou.pt --input image.jpg --merge input,overlay,comparison --output-dir results/
 ```
 Inference outputs `_class.png` (0/1), `_binary.png` (0/255), `_prob.jpg` (saliency heatmap), `_prob_gray.png` (grayscale probability mask [0, 255]), and `_overlay.jpg` (colour blend) for each image.
 
@@ -420,6 +423,16 @@ If a Ground Truth mask is provided via `--gt` or automatically discovered (e.g. 
 - **Green** (0, 255, 0) : **True Positive (TP)** - prediction matches GT foreground.
 - **Blue** (255, 0, 0) : **False Positive (FP)** - prediction is foreground but GT is background (false alarm).
 - **Red** (0, 0, 255)  : **False Negative (FN)** - prediction is background but GT is foreground (missed area).
+
+### Merged Output Collage
+You can save a combined horizontal collage of maps side-by-side using the `--merge` parameter. Specify a comma-separated list of the maps you want to include:
+- `input`: Original input image (labeled as `Input Image`)
+- `mask`: 3-channel binary mask (labeled as `Binary Mask`)
+- `overlay`: Green mask prediction blend (labeled as `Prediction Overlay`)
+- `prob`: Colorized saliency heatmap (labeled as `Saliency Heatmap`)
+- `comparison`: TP/FP/FN error diagnostic overlay (labeled as `Error Diagnostic (TP/FP/FN)`, only generated if GT is available)
+
+The resulting collage is saved as `[image_name]_merged.jpg`.
 
 It logs model-only latency and end-to-end latency separately.
 
