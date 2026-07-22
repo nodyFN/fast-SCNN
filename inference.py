@@ -211,6 +211,44 @@ def draw_label(img: np.ndarray, text: str) -> np.ndarray:
     return labeled
 
 
+def create_info_panel(img_template: np.ndarray, model_name: str) -> np.ndarray:
+    """Create a professional dark info panel with model diagnostic text."""
+    panel = np.zeros_like(img_template)
+    # Fill background with dark grey (30, 30, 30)
+    panel[:] = (30, 30, 30)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 2
+
+    h, w = panel.shape[:2]
+    # Adjust spacing and scale based on image dimensions
+    scale_title = max(min(w / 800.0, 1.2), 0.7)
+    scale_text = max(min(w / 1000.0, 0.9), 0.5)
+
+    # Title
+    cv2.putText(
+        panel, "FAST-SCNN DIAGNOSTICS", (40, int(h * 0.25)),
+        font, scale_title, (0, 255, 127), thickness + 1, cv2.LINE_AA
+    )
+
+    # Draw line decoration
+    cv2.line(panel, (40, int(h * 0.3)), (w - 40, int(h * 0.3)), (80, 80, 80), 2)
+
+    # Details
+    details = [
+        f"Model Name  : {model_name.upper()}",
+        f"Resolution  : {w}x{h}",
+        f"Status      : Success",
+    ]
+    for idx, text in enumerate(details):
+        y_pos = int(h * 0.45) + idx * int(h * 0.12)
+        cv2.putText(
+            panel, text, (40, y_pos),
+            font, scale_text, (200, 200, 200), thickness, cv2.LINE_AA
+        )
+    return panel
+
+
 def create_combined_image(
     image_bgr: np.ndarray,
     binary_mask: np.ndarray,
@@ -218,10 +256,13 @@ def create_combined_image(
     prob_color: np.ndarray,
     comparison: Optional[np.ndarray],
     keys: list[str],
+    model_name: str = "fast_scnn",
 ) -> Optional[np.ndarray]:
-    """Concatenate selected outputs horizontally with labels.
+    """Concatenate selected outputs into a grid or row with labels.
 
-    Supported keys: 'input', 'mask', 'overlay', 'prob', 'comparison'
+    - If <= 3 images: horizontal row (1 row)
+    - If == 4 images: 2x2 grid
+    - If >= 5 images: 2x3 grid (uses a dark diagnostics info panel as the 6th item)
     """
     images = []
     for k in keys:
@@ -246,9 +287,24 @@ def create_combined_image(
             else:
                 logger.warning("Comparison requested in merge but Ground Truth is not available.")
     
-    if not images:
+    n = len(images)
+    if n == 0:
         return None
-    return np.hstack(images)
+
+    if n <= 3:
+        # Single row
+        return np.hstack(images)
+    elif n == 4:
+        # 2x2 grid
+        row1 = np.hstack(images[:2])
+        row2 = np.hstack(images[2:])
+        return np.vstack([row1, row2])
+    else:
+        # 2x3 grid
+        info_panel = create_info_panel(image_bgr, model_name)
+        row1 = np.hstack(images[:3])
+        row2 = np.hstack(images[3:5] + [info_panel])
+        return np.vstack([row1, row2])
 
 
 def infer_single(
@@ -360,6 +416,7 @@ def infer_single(
         combined_img = create_combined_image(
             image_bgr, results["binary_mask"], overlay,
             prob_color, comp_overlay, merge_keys,
+            model_name=model_name,
         )
         if combined_img is not None:
             cv2.imwrite(str(output_dir / f"{stem}_merged.jpg"), combined_img)
