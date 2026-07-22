@@ -344,7 +344,17 @@ def main() -> None:
 
     dir_path = Path(args.dir)
     
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        print("\n" + "="*70)
+        print("ERROR: No display detected (X11/$DISPLAY is missing).")
+        print("This is expected because you are running on a remote headless server.")
+        print("Please run the optimized Web Viewer instead on the remote VM:")
+        print(f"\n   python view_results.py --dir {args.dir}")
+        print("\nThen access it locally in your browser using SSH port forwarding.")
+        print("="*70 + "\n")
+        sys.exit(1)
     
     # Initialize the Tkinter app
     app = DiagnosticsViewerApp(root, dir_path)
