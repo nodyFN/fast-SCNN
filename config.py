@@ -167,6 +167,7 @@ class Config:
     ddc_window_size: int = 11
     ddc_num_neighbors: int = 11
     ddc_lambda: float = 10.0
+    ddc_warmup_epochs: int = 5  # Warmup epochs for DDC loss to prevent initial weight collapse
     ddc_chunk_size: int = 4096
     ddc_padding_mode: str = "replicate"
     ddc_exclude_center: bool = True

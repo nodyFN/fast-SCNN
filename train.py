@@ -327,7 +327,15 @@ def train_one_epoch_matting(
     running = {}
     num_batches = 0
 
+    # DDC Lambda Warmup: linearly scale ddc_lambda over the first cfg.ddc_warmup_epochs
+    if getattr(cfg, "ddc_warmup_epochs", 0) > 0:
+        current_ddc_lambda = cfg.ddc_lambda * min(1.0, epoch / cfg.ddc_warmup_epochs)
+    else:
+        current_ddc_lambda = cfg.ddc_lambda
+
     disable_tqdm = (os.environ.get("RANK", "0") != "0") or getattr(cfg, 'no_tqdm', False)
+    if os.environ.get("RANK", "0") == "0":
+        logger.info(f"Epoch {epoch} [matting] - Active DDC Lambda: {current_ddc_lambda:.4f}")
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [matting]", leave=False, disable=disable_tqdm)
 
     for batch in pbar:
@@ -360,7 +368,7 @@ def train_one_epoch_matting(
         total_loss = (
             cfg.lambda_coarse_known * coarse_known_loss
             + cfg.lambda_fine_known * fine_known_loss
-            + cfg.ddc_lambda * ddc_loss
+            + current_ddc_lambda * ddc_loss
         )
 
         # Build loss dict
@@ -1166,6 +1174,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ddc-window-size", type=int, default=None)
     p.add_argument("--ddc-num-neighbors", type=int, default=None)
     p.add_argument("--ddc-lambda", type=float, default=None)
+    p.add_argument("--ddc-warmup-epochs", type=int, default=None,
+                   help="Number of epochs to linearly scale DDC lambda from 0 to target")
     p.add_argument("--ddc-chunk-size", type=int, default=None)
     p.add_argument("--ddc-downsample-factor", type=int, default=None)
     p.add_argument("--lambda-coarse-known", type=float, default=None)
@@ -1269,6 +1279,8 @@ def main() -> None:
         cfg.ddc_num_neighbors = args.ddc_num_neighbors
     if args.ddc_lambda is not None:
         cfg.ddc_lambda = args.ddc_lambda
+    if args.ddc_warmup_epochs is not None:
+        cfg.ddc_warmup_epochs = args.ddc_warmup_epochs
     if args.ddc_chunk_size is not None:
         cfg.ddc_chunk_size = args.ddc_chunk_size
     if args.ddc_downsample_factor is not None:
