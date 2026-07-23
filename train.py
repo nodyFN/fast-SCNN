@@ -159,8 +159,8 @@ def train_one_epoch(
     running = {}
     num_batches = 0
 
-    # Disable progress bar on non-master ranks to avoid output clutter
-    disable_tqdm = (os.environ.get("RANK", "0") != "0")
+    # Disable progress bar on non-master ranks to avoid output clutter, or if no_tqdm is requested
+    disable_tqdm = (os.environ.get("RANK", "0") != "0") or getattr(cfg, 'no_tqdm', False)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=disable_tqdm)
     for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
@@ -327,7 +327,7 @@ def train_one_epoch_matting(
     running = {}
     num_batches = 0
 
-    disable_tqdm = (os.environ.get("RANK", "0") != "0")
+    disable_tqdm = (os.environ.get("RANK", "0") != "0") or getattr(cfg, 'no_tqdm', False)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [matting]", leave=False, disable=disable_tqdm)
 
     for batch in pbar:
@@ -1122,6 +1122,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Fast-SCNN")
     p.add_argument("--profile", choices=["paper", "project", "paper_am2k", "paper_p3m", "tv_ddc"], default=None,
                    help="Training profile (default: use config.py defaults)")
+    p.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars")
     p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default=None,
                    help="Model architecture to train (default: fast_scnn)")
     p.add_argument("--data-root", type=str, default=None)
@@ -1240,6 +1241,8 @@ def main() -> None:
             cfg.early_stopping_enabled = False
     if args.allow_threshold is not None:
         cfg.allow_threshold = args.allow_threshold
+    if args.no_tqdm:
+        cfg.no_tqdm = True
 
     # DDC Matting specific overrides
     if args.task_mode:

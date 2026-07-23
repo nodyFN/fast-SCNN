@@ -79,6 +79,7 @@ class Config:
     # ── Training ──────────────────────────────────────────────────────
     epochs: int = 200
     amp: bool = True  # Only effective when CUDA is available
+    no_tqdm: bool = False  # Disable tqdm progress bars
     gradient_clip_max_norm: float = 1.0  # [PROJECT DECISION]
     gradient_clip_enabled: bool = True  # [PROJECT DECISION]
 
