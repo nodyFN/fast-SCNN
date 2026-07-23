@@ -676,6 +676,7 @@ def train(cfg: Config) -> None:
         crop_w = cfg.matting_crop_width
         train_transform = build_matting_train_transform(
             crop_h, crop_w, cfg.aug_scale_min, cfg.aug_scale_max,
+            longest_max_size=getattr(cfg, "longest_max_size", None),
         )
         val_transform = build_matting_val_transform(crop_h, crop_w)
         train_ds = MattingDataset(
@@ -697,6 +698,7 @@ def train(cfg: Config) -> None:
     else:
         train_transform = build_train_transform(
             cfg.train_height, cfg.train_width, cfg.aug_scale_min, cfg.aug_scale_max,
+            longest_max_size=getattr(cfg, "longest_max_size", None),
         )
         val_transform = build_val_transform(cfg.val_height, cfg.val_width)
         train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform, allow_threshold=cfg.allow_threshold)
@@ -1129,6 +1131,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None, dest="learning_rate")
+    p.add_argument("--longest-max-size", type=int, default=None,
+                   help="Resize longest side of images to this size before augmentation")
     p.add_argument("--optimizer", choices=["sgd", "adamw"], default=None)
     p.add_argument("--scheduler", choices=["poly", "cosine", "multistep"], default=None)
     p.add_argument("--train-height", type=int, default=None)
@@ -1205,6 +1209,8 @@ def main() -> None:
         cfg.batch_size = args.batch_size
     if args.learning_rate is not None:
         cfg.learning_rate = args.learning_rate
+    if args.longest_max_size is not None:
+        cfg.longest_max_size = args.longest_max_size
     if args.optimizer:
         cfg.optimizer = args.optimizer
     if args.scheduler:

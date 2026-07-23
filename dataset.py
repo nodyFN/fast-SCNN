@@ -180,6 +180,7 @@ def build_train_transform(
     width: int = 1024,
     scale_min: float = 0.5,
     scale_max: float = 2.0,
+    longest_max_size: Optional[int] = None,
 ) -> A.Compose:
     """Training augmentation pipeline.
 
@@ -192,7 +193,11 @@ def build_train_transform(
 
     Mask interpolation uses nearest-neighbor.
     """
-    return A.Compose(
+    transforms = []
+    if longest_max_size is not None:
+        transforms.append(A.LongestMaxSize(max_size=longest_max_size, p=1.0))
+
+    transforms.extend(
         [
             # Random scale (paper: 0.5–2.0)
             A.RandomScale(scale_limit=(scale_min - 1.0, scale_max - 1.0), p=1.0),
@@ -230,6 +235,7 @@ def build_train_transform(
             ToTensorV2(),
         ]
     )
+    return A.Compose(transforms)
 
 
 def build_val_transform(
@@ -545,6 +551,7 @@ def build_matting_train_transform(
     width: int = 512,
     scale_min: float = 0.5,
     scale_max: float = 2.0,
+    longest_max_size: Optional[int] = None,
 ) -> A.Compose:
     """Training augmentation for matting (NO Normalize or ToTensorV2).
 
@@ -554,7 +561,11 @@ def build_matting_train_transform(
 
     Trimap uses nearest-neighbor interpolation via additional_targets.
     """
-    return A.Compose(
+    transforms = []
+    if longest_max_size is not None:
+        transforms.append(A.LongestMaxSize(max_size=longest_max_size, p=1.0))
+
+    transforms.extend(
         [
             A.RandomScale(scale_limit=(scale_min - 1.0, scale_max - 1.0), p=1.0),
             A.PadIfNeeded(
@@ -570,9 +581,9 @@ def build_matting_train_transform(
             A.ColorJitter(
                 brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.3,
             ),
-        ],
-        additional_targets={"trimap": "mask"},
+        ]
     )
+    return A.Compose(transforms, additional_targets={"trimap": "mask"})
 
 
 def build_matting_val_transform(

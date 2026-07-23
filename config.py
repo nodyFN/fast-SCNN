@@ -135,6 +135,7 @@ class Config:
     # ── Augmentation (paper-compatible range) ─────────────────────────
     aug_scale_min: float = 0.5  # Paper: 0.5
     aug_scale_max: float = 2.0  # Paper: 2.0
+    longest_max_size: Optional[int] = None  # Pre-resize high-res images before scaling/cropping
 
     # ── Salient Dual-Head Model ──────────────────────────────────────
     coarse_channels: int = 64
