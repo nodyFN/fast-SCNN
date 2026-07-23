@@ -441,11 +441,16 @@ class MattingDataset(Dataset):
         # Convert mask to binary {0, 1}
         mask = self._convert_mask(mask, mask_path)
 
-        # Load trimap from file if requested
-        trimap_from_file = None
         if self.trimap_source == "file":
             from utils.trimap import load_trimap_from_file
+            # Search for the trimap file dynamically among common extensions
             trimap_path = self.trimap_dir / f"{img_path.stem}.png"
+            if not trimap_path.exists():
+                for ext in (".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+                    p = self.trimap_dir / f"{img_path.stem}{ext}"
+                    if p.exists():
+                        trimap_path = p
+                        break
             trimap_from_file = load_trimap_from_file(trimap_path)
 
         # Apply geometric augmentations (same transform for image, mask, trimap)

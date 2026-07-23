@@ -153,26 +153,27 @@ def load_trimap_from_file(
     if trimap is None:
         raise IOError(f"Failed to read trimap: {path}")
 
-    unique = set(np.unique(trimap).tolist())
+    # Determine format and map values robustly (handles lossy JPG noise)
+    max_val = trimap.max()
+    result = np.zeros_like(trimap, dtype=np.float32)
 
-    # {0, 128, 255} format
-    if unique <= {0, 128, 255}:
-        result = np.zeros_like(trimap, dtype=np.float32)
-        result[trimap == 128] = 0.5
-        result[trimap == 255] = 1.0
-        return result
-
-    # {0, 1, 2} label format
-    if unique <= {0, 1, 2}:
-        result = np.zeros_like(trimap, dtype=np.float32)
+    if max_val <= 2:
+        # {0, 1, 2} label format: 0=BG, 1=Unknown, 2=FG
         result[trimap == 1] = 0.5
         result[trimap == 2] = 1.0
-        return result
+        unique = set(np.unique(trimap).tolist())
+        if not (unique <= {0, 1, 2}):
+            raise ValueError(
+                f"Trimap '{path}' in label format contains unexpected values: {sorted(unique)}. "
+                f"Expected subset of {{0, 1, 2}}."
+            )
+    else:
+        # {0, 128, 255} grayscale format: BG (<64), Unknown (64<=v<192), FG (>=192)
+        # This is robust to compression artifacts (like 127 instead of 128)
+        result[(trimap >= 64) & (trimap < 192)] = 0.5
+        result[trimap >= 192] = 1.0
 
-    raise ValueError(
-        f"Trimap '{path}' contains unexpected values: {sorted(unique)}. "
-        f"Expected {{0, 128, 255}} or {{0, 1, 2}}."
-    )
+    return result
 
 
 def validate_trimap_values(trimap: torch.Tensor) -> bool:
