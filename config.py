@@ -171,7 +171,7 @@ class Config:
     ddc_chunk_size: int = 4096
     ddc_padding_mode: str = "replicate"
     ddc_exclude_center: bool = True
-    ddc_reduction: str = "paper"
+    ddc_reduction: str = "mean_neighbors"
     ddc_downsample_factor: int = 1
 
     # DDC Matting Loss weights

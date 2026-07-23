@@ -1176,6 +1176,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ddc-lambda", type=float, default=None)
     p.add_argument("--ddc-warmup-epochs", type=int, default=None,
                    help="Number of epochs to linearly scale DDC lambda from 0 to target")
+    p.add_argument("--ddc-reduction", choices=["paper", "mean_neighbors"], default=None,
+                   help="Reduction mode for DDC loss: paper (sum over neighbors) or mean_neighbors")
     p.add_argument("--ddc-chunk-size", type=int, default=None)
     p.add_argument("--ddc-downsample-factor", type=int, default=None)
     p.add_argument("--lambda-coarse-known", type=float, default=None)
@@ -1283,6 +1285,8 @@ def main() -> None:
         cfg.ddc_warmup_epochs = args.ddc_warmup_epochs
     if args.ddc_chunk_size is not None:
         cfg.ddc_chunk_size = args.ddc_chunk_size
+    if args.ddc_reduction is not None:
+        cfg.ddc_reduction = args.ddc_reduction
     if args.ddc_downsample_factor is not None:
         cfg.ddc_downsample_factor = args.ddc_downsample_factor
     if args.lambda_coarse_known is not None:
