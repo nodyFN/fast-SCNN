@@ -131,6 +131,7 @@ class Config:
 
     # ── Visualization ─────────────────────────────────────────────────
     num_vis_samples: int = 4
+    vis_interval: int = 1  # Save validation visualization images every N epochs
 
     # ── Augmentation (paper-compatible range) ─────────────────────────
     aug_scale_min: float = 0.5  # Paper: 0.5

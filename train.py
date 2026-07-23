@@ -1028,7 +1028,7 @@ def train(cfg: Config) -> None:
 
             # Visualization & Curves (Rank 0 only)
             if rank == 0:
-                if epoch % max(cfg.epochs // 20, 1) == 0 or epoch == cfg.epochs - 1:
+                if epoch % cfg.vis_interval == 0 or epoch == cfg.epochs - 1:
                     try:
                         model.eval()
                         sample_batch = next(iter(val_loader))
@@ -1187,6 +1187,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--foreground-threshold", type=float, default=None)
     p.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     p.add_argument("--scheduler-gamma", type=float, default=None)
+    p.add_argument("--vis-interval", type=int, default=None,
+                   help="Save validation visualization images every N epochs")
     return p.parse_args()
 
 
@@ -1287,6 +1289,8 @@ def main() -> None:
         cfg.ddc_chunk_size = args.ddc_chunk_size
     if args.ddc_reduction is not None:
         cfg.ddc_reduction = args.ddc_reduction
+    if args.vis_interval is not None:
+        cfg.vis_interval = args.vis_interval
     if args.ddc_downsample_factor is not None:
         cfg.ddc_downsample_factor = args.ddc_downsample_factor
     if args.lambda_coarse_known is not None:
