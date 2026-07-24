@@ -1362,6 +1362,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--foreground-threshold", type=float, default=None)
     p.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     p.add_argument("--scheduler-gamma", type=float, default=None)
+    p.add_argument("--vis-interval", type=int, default=None,
+                   help="Save validation visualization images every N epochs")
     # Knowledge Distillation (KD) arguments
     p.add_argument("--teacher-weights", type=str, default=None,
                    help="Path to pre-trained UNet teacher weights checkpoint")
