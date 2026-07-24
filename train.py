@@ -51,10 +51,10 @@ from dataset import (
     build_matting_train_transform,
     build_matting_val_transform,
 )
-from models import FastSCNN, FastSCNNSalient, count_parameters
+from models import FastSCNN, FastSCNNSalient, UNet, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
-from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss
 from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
 from utils.scheduler import build_scheduler
@@ -153,6 +153,7 @@ def train_one_epoch(
     epoch: int,
     writer: Optional[SummaryWriter] = None,
     use_amp: bool = False,
+    teacher: Optional[nn.Module] = None,
 ) -> tuple:
     """Run one training epoch. Returns (loss_dict, updated_global_step)."""
     model.train()
@@ -183,6 +184,24 @@ def train_one_epoch(
                     aux_downsample_weight=cfg.aux_downsample_weight,
                     aux_global_weight=cfg.aux_global_weight,
                 )
+
+            if teacher is not None:
+                with torch.no_grad():
+                    teacher_out = teacher(images)
+                
+                is_sal = (cfg.model == "fast_scnn_salient")
+                kd_loss = compute_kd_loss(
+                    student_out=output,
+                    teacher_out=teacher_out,
+                    loss_type=getattr(cfg, "kd_loss_type", "mse"),
+                    temp=getattr(cfg, "kd_temperature", 1.0),
+                    is_salient=is_sal,
+                )
+                
+                alpha = getattr(cfg, "kd_alpha", 0.5)
+                losses["student_total"] = losses["total"]
+                losses["kd"] = kd_loss
+                losses["total"] = (1.0 - alpha) * losses["student_total"] + alpha * kd_loss
 
         total_loss = losses["total"]
 
@@ -611,6 +630,17 @@ def run_smoke_test(cfg: Config) -> None:
         ignore_index=cfg.ignore_index
     )
 
+    # Load Teacher Model for KD in smoke test if requested
+    teacher = None
+    if getattr(cfg, "teacher_weights", None):
+        logger.info(f"  Smoke test: loading teacher from {cfg.teacher_weights}...")
+        teacher_out_ch = 1 if cfg.model == "fast_scnn_salient" else cfg.num_classes
+        teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
+        load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+
     h, w = 64, 128  # Small resolution for speed
     bs = 2
 
@@ -637,6 +667,23 @@ def run_smoke_test(cfg: Config) -> None:
                 else:
                     losses = compute_total_loss(criterion, output, masks,
                                                 cfg.aux_downsample_weight, cfg.aux_global_weight)
+
+                if teacher is not None:
+                    with torch.no_grad():
+                        teacher_out = teacher(images)
+                    is_sal = (cfg.model == "fast_scnn_salient")
+                    kd_loss = compute_kd_loss(
+                        student_out=output,
+                        teacher_out=teacher_out,
+                        loss_type=getattr(cfg, "kd_loss_type", "mse"),
+                        temp=getattr(cfg, "kd_temperature", 1.0),
+                        is_salient=is_sal,
+                    )
+                    alpha = getattr(cfg, "kd_alpha", 0.5)
+                    losses["student_total"] = losses["total"]
+                    losses["kd"] = kd_loss
+                    losses["total"] = (1.0 - alpha) * losses["student_total"] + alpha * kd_loss
+
             loss = losses["total"]
             if scaler:
                 scaler.scale(loss).backward()
@@ -674,7 +721,7 @@ def run_smoke_test(cfg: Config) -> None:
     ckpt_path = cfg.checkpoint_dir / "smoke_test.pt"
     save_checkpoint(
         ckpt_path, epoch=1, global_step=4, model=model, optimizer=optimizer,
-        scheduler=scheduler, scaler=scaler, best_miou=m["miou"],
+        scheduler=scheduler, scaler=scaler, best_miou=res["miou"],
         num_classes=cfg.num_classes, seed=cfg.seed,
     )
     loaded = load_checkpoint(ckpt_path, model, optimizer, scheduler, scaler,
@@ -847,6 +894,18 @@ def train(cfg: Config) -> None:
         from models.fast_scnn import FastSCNNMattingAdapter
         model = FastSCNNMattingAdapter(model).to(device)
 
+    # Load Teacher Model for Knowledge Distillation if requested
+    teacher = None
+    if getattr(cfg, "teacher_weights", None):
+        logger.info(f"Setting up UNet Teacher Model from {cfg.teacher_weights}...")
+        teacher_out_ch = 1 if cfg.model == "fast_scnn_salient" else cfg.num_classes
+        teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
+        load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+
+
     total_p, trainable_p = count_parameters(model)
     logger.info(f"Parameters: total={total_p:,}  trainable={trainable_p:,}")
 
@@ -987,6 +1046,7 @@ def train(cfg: Config) -> None:
                 train_losses, global_step = train_one_epoch(
                     model, train_loader, criterion, optimizer, scheduler,
                     scaler, device, cfg, global_step, epoch, writer, use_amp,
+                    teacher=teacher,
                 )
 
             # Epoch-based scheduler step (CosineAnnealing / MultiStep)
@@ -1288,8 +1348,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--foreground-threshold", type=float, default=None)
     p.add_argument("--scheduler-milestones", type=int, nargs="+", default=None)
     p.add_argument("--scheduler-gamma", type=float, default=None)
-    p.add_argument("--vis-interval", type=int, default=None,
-                   help="Save validation visualization images every N epochs")
+    # Knowledge Distillation (KD) arguments
+    p.add_argument("--teacher-weights", type=str, default=None,
+                   help="Path to pre-trained UNet teacher weights checkpoint")
+    p.add_argument("--kd-alpha", type=float, default=None,
+                   help="Weight for KD loss component (between 0.0 and 1.0)")
+    p.add_argument("--kd-temperature", type=float, default=None,
+                   help="Scaling temperature for distillation logits/probabilities")
+    p.add_argument("--kd-loss-type", choices=["mse", "l1", "kl"], default=None,
+                   help="Loss type for distillation")
     return p.parse_args()
 
 
@@ -1426,6 +1493,14 @@ def main() -> None:
         cfg.hard_negative_ratio = args.hard_negative_ratio
     if args.threshold_sweep is not None:
         cfg.threshold_sweep = args.threshold_sweep
+    if args.teacher_weights is not None:
+        cfg.teacher_weights = args.teacher_weights
+    if args.kd_alpha is not None:
+        cfg.kd_alpha = args.kd_alpha
+    if args.kd_temperature is not None:
+        cfg.kd_temperature = args.kd_temperature
+    if args.kd_loss_type is not None:
+        cfg.kd_loss_type = args.kd_loss_type
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

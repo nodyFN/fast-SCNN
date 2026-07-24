@@ -727,6 +727,32 @@ python train.py \
   --boundary-extra-weight 4.0 \
   --hard-negative-ratio 0.10 \
   --threshold-sweep
+### Knowledge Distillation (KD) with UNet Teacher
+
+You can perform Knowledge Distillation during training to guide the student model (`FastSCNN` / `FastSCNNSalient`) using a pre-trained **UNet Teacher** model.
+
+#### Loss Formulation
+The distillation loss supports the following modes:
+- **`mse`**: Mean Squared Error on soft logits scaled by temperature $T$:
+  $$L_{kd} = T^2 \times \text{MSE}\left(\frac{z_s}{T}, \frac{z_t}{T}\right)$$
+- **`l1`**: Mean Absolute Error on probabilities.
+- **`kl`**: Kullback-Leibler divergence on probability distributions.
+
+The total objective is:
+$$L_{total} = (1 - \alpha) \times L_{student} + \alpha \times L_{kd}$$
+
+#### Usage
+To train with KD, provide the path to your pre-trained UNet teacher weights using `--teacher-weights`:
+
+```bash
+python train.py \
+  --model fast_scnn_salient \
+  --data-root duts_data \
+  --allow-threshold \
+  --teacher-weights checkpoints/UNET_TEACHER/best_miou.pt \
+  --kd-alpha 0.5 \
+  --kd-temperature 1.5 \
+  --kd-loss-type mse
 ```
 
 ---

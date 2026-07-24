@@ -760,3 +760,46 @@ class PrecisionSalientLoss(nn.Module):
             "fine_boundary_bce": fine_boundary_bce,
             "fine_hard_negative": fine_hard_negative,
         }
+
+
+def compute_kd_loss(
+    student_out: torch.Tensor | Dict[str, torch.Tensor],
+    teacher_out: torch.Tensor,
+    loss_type: str = "mse",
+    temp: float = 1.0,
+    is_salient: bool = True,
+) -> torch.Tensor:
+    """Compute Knowledge Distillation (KD) Loss between student and teacher."""
+    if is_salient:
+        s_logits = student_out["fine_logits"] if isinstance(student_out, dict) else student_out
+        t_logits = teacher_out
+        if loss_type == "mse":
+            return F.mse_loss(s_logits / temp, t_logits / temp) * (temp * temp)
+        elif loss_type == "l1":
+            return F.l1_loss(torch.sigmoid(s_logits / temp), torch.sigmoid(t_logits / temp))
+        elif loss_type == "kl":
+            s_prob = torch.sigmoid(s_logits / temp)
+            t_prob = torch.sigmoid(t_logits / temp)
+            # Create binary categorical distributions
+            s_dist = torch.stack([1.0 - s_prob, s_prob], dim=-1)
+            t_dist = torch.stack([1.0 - t_prob, t_prob], dim=-1)
+            # Clip to avoid log(0)
+            eps = 1e-7
+            s_dist = torch.clamp(s_dist, min=eps, max=1.0)
+            t_dist = torch.clamp(t_dist, min=eps, max=1.0)
+            return F.kl_div(s_dist.log(), t_dist, reduction="batchmean") * (temp * temp)
+        else:
+            raise ValueError(f"Unknown kd_loss_type: {loss_type}")
+    else:
+        s_logits = student_out
+        t_logits = teacher_out
+        if loss_type == "kl":
+            s_log_prob = F.log_softmax(s_logits / temp, dim=1)
+            t_prob = F.softmax(t_logits / temp, dim=1)
+            return F.kl_div(s_log_prob, t_prob, reduction="batchmean") * (temp * temp)
+        elif loss_type == "mse":
+            return F.mse_loss(s_logits / temp, t_logits / temp) * (temp * temp)
+        elif loss_type == "l1":
+            return F.l1_loss(F.softmax(s_logits / temp, dim=1), F.softmax(t_logits / temp, dim=1))
+        else:
+            raise ValueError(f"Unknown kd_loss_type: {loss_type}")

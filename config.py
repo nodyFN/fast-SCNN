@@ -222,6 +222,12 @@ class Config:
     threshold_sweep: bool = False
     best_validation_threshold: float = 0.5
 
+    # Knowledge Distillation (KD)
+    teacher_weights: Optional[str] = None
+    kd_alpha: float = 0.5
+    kd_temperature: float = 1.0
+    kd_loss_type: str = "mse"  # "mse" | "l1" | "kl"
+
     # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None
     scheduler_gamma: float = 0.1
