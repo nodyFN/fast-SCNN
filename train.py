@@ -966,7 +966,7 @@ def train(cfg: Config) -> None:
             f"window={cfg.ddc_window_size}, neighbors={cfg.ddc_num_neighbors}, "
             f"chunk_size={cfg.ddc_chunk_size}, downsample={cfg.ddc_downsample_factor}"
         )
-    elif cfg.model == "fast_scnn_salient":
+    elif cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
         if cfg.loss_profile == "precision_salient":
             criterion = PrecisionSalientLoss(cfg).to(device)
         else:
