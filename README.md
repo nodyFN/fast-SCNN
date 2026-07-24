@@ -755,6 +755,21 @@ python train.py \
   --kd-loss-type mse
 ```
 
+#### Training the UNet Teacher Model
+You can also train the UNet model directly on your dataset using the same training script:
+
+```bash
+python train.py \
+  --model unet \
+  --data-root duts_data \
+  --allow-threshold \
+  --loss-profile precision_salient \
+  --epochs 100 \
+  --batch-size 16 \
+  --lr 0.001
+```
+This will produce a standard UNet checkpoint which you can subsequently use as the teacher model (`--teacher-weights`).
+
 ---
 
 ## Trimap Generation Tool

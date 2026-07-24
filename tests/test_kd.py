@@ -102,3 +102,20 @@ def test_kd_save_load_teacher():
         # Verify weight equivalence
         for p1, p2 in zip(teacher.parameters(), new_teacher.parameters()):
             assert torch.allclose(p1, p2)
+
+
+def test_unet_salient_adapter():
+    from models.unet import UNetSalientAdapter
+    unet = UNet(in_channels=3, out_channels=1, init_features=8)
+    adapter = UNetSalientAdapter(unet)
+    adapter.train()
+    
+    x = torch.randn(2, 3, 64, 128)
+    out = adapter(x)
+    
+    assert isinstance(out, dict)
+    assert "coarse_logits" in out
+    assert "fine_logits" in out
+    assert out["coarse_logits"].shape == (2, 1, 64, 128)
+    assert out["fine_logits"].shape == (2, 1, 64, 128)
+

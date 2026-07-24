@@ -51,7 +51,7 @@ from dataset import (
     build_matting_train_transform,
     build_matting_val_transform,
 )
-from models import FastSCNN, FastSCNNSalient, UNet, count_parameters
+from models import FastSCNN, FastSCNNSalient, UNet, UNetSalientAdapter, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
 from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss
@@ -171,7 +171,7 @@ def train_one_epoch(
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             output = model(images)
-            if cfg.model == "fast_scnn_salient":
+            if cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
                 targets = masks.unsqueeze(1).float()
                 losses = criterion(
                     coarse_logits=output["coarse_logits"],
@@ -275,7 +275,7 @@ def validate(
     running_loss = 0.0
     num_batches = 0
 
-    is_salient = (cfg.model == "fast_scnn_salient")
+    is_salient = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
     do_sweep = is_salient and getattr(cfg, "threshold_sweep", False)
 
     if do_sweep:
@@ -603,7 +603,8 @@ def run_smoke_test(cfg: Config) -> None:
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device=device.type) if use_amp else None
 
-    if cfg.model == "fast_scnn_salient":
+    is_salient_mode = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
+    if is_salient_mode:
         if cfg.loss_profile == "precision_salient":
             criterion = PrecisionSalientLoss(cfg)
         else:
@@ -626,7 +627,7 @@ def run_smoke_test(cfg: Config) -> None:
         )
 
     metrics_obj = SegmentationMetrics(
-        num_classes=2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+        num_classes=2 if is_salient_mode else cfg.num_classes,
         ignore_index=cfg.ignore_index
     )
 
@@ -650,14 +651,14 @@ def run_smoke_test(cfg: Config) -> None:
         for _ in range(2):
             images = torch.randn(bs, 3, h, w, device=device)
             masks = torch.randint(
-                0, 2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+                0, 2 if is_salient_mode else cfg.num_classes,
                 (bs, h, w), device=device
             )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 output = model(images)
-                if cfg.model == "fast_scnn_salient":
+                if is_salient_mode:
                     targets = masks.unsqueeze(1).float()
                     losses = criterion(
                         coarse_logits=output["coarse_logits"],
@@ -671,7 +672,7 @@ def run_smoke_test(cfg: Config) -> None:
                 if teacher is not None:
                     with torch.no_grad():
                         teacher_out = teacher(images)
-                    is_sal = (cfg.model == "fast_scnn_salient")
+                    is_sal = is_salient_mode
                     kd_loss = compute_kd_loss(
                         student_out=output,
                         teacher_out=teacher_out,
@@ -702,11 +703,11 @@ def run_smoke_test(cfg: Config) -> None:
         with torch.inference_mode():
             images = torch.randn(bs, 3, h, w, device=device)
             masks = torch.randint(
-                0, 2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+                0, 2 if is_salient_mode else cfg.num_classes,
                 (bs, h, w), device=device
             )
             output = model(images)
-            if cfg.model == "fast_scnn_salient":
+            if is_salient_mode:
                 preds = (output["fine_logits"] > 0.0).squeeze(1).long()
             else:
                 preds = output
@@ -861,6 +862,14 @@ def train(cfg: Config) -> None:
             fine_output_channels=cfg.fine_output_channels,
             fine_dropout=cfg.fine_dropout,
         ).to(device)
+    elif cfg.model == "unet":
+        is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
+        unet_out_ch = 1 if is_salient_task else cfg.num_classes
+        unet_model = UNet(in_channels=3, out_channels=unet_out_ch).to(device)
+        if is_salient_task:
+            model = UNetSalientAdapter(unet_model)
+        else:
+            model = unet_model
     else:
         # For matting, standard FastSCNN outputs 1 channel and disables auxiliary heads
         num_classes = 1 if is_matting else cfg.num_classes
@@ -882,12 +891,17 @@ def train(cfg: Config) -> None:
                 param.requires_grad = False
             for param in model.backbone.global_feature_extractor.parameters():
                 param.requires_grad = False
+        elif cfg.model == "unet":
+            unet_ref = model.unet if isinstance(model, UNetSalientAdapter) else model
+            for layer in [unet_ref.encoder1, unet_ref.encoder2, unet_ref.encoder3, unet_ref.encoder4]:
+                for param in layer.parameters():
+                    param.requires_grad = False
         else:
             for param in model.learning_to_downsample.parameters():
                 param.requires_grad = False
             for param in model.global_feature_extractor.parameters():
                 param.requires_grad = False
-        logger.info("Backbone modules (LearningToDownsample & GlobalFeatureExtractor) have been FROZEN.")
+        logger.info("Backbone modules/Encoder layers have been FROZEN.")
 
     # Wrap FastSCNN with matting adapter if needed
     if is_matting and cfg.model == "fast_scnn":
@@ -1274,7 +1288,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--profile", choices=["paper", "project", "paper_am2k", "paper_p3m", "tv_ddc"], default=None,
                    help="Training profile (default: use config.py defaults)")
     p.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars")
-    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient"], default=None,
+    p.add_argument("--model", choices=["fast_scnn", "fast_scnn_salient", "unet"], default=None,
                    help="Model architecture to train (default: fast_scnn)")
     p.add_argument("--data-root", type=str, default=None)
     p.add_argument("--epochs", type=int, default=None)

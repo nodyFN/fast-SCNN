@@ -92,3 +92,19 @@ class UNet(nn.Module):
         dec1 = self.decoder1(dec1)
 
         return self.conv(dec1)
+
+
+class UNetSalientAdapter(nn.Module):
+    """Adapter to map single-head UNet outputs to the dual-head dict expected by salient segmentation."""
+    def __init__(self, unet_model: nn.Module) -> None:
+        super().__init__()
+        self.unet = unet_model
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        out = self.unet(x)
+        return {
+            "coarse_logits": out,
+            "fine_logits": out,
+            "coarse_prob": torch.sigmoid(out),
+            "fine_prob": torch.sigmoid(out),
+        }
