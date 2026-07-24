@@ -556,24 +556,38 @@ def main() -> None:
     cfg = Config()
 
     # Model
+    # Load checkpoint to get config metadata first
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    checkpoint_config = ckpt.get("config", {})
+    task_mode = checkpoint_config.get("task_mode", "segmentation")
+
+    # Build model (aux=False to load all weights, then wrap for inference)
     if args.model == "fast_scnn_salient":
         model = FastSCNNSalient(
-            ppm_pool_sizes=cfg.ppm_pool_sizes,
-            coarse_channels=cfg.coarse_channels,
-            refinement_channels=cfg.refinement_channels,
-            dropout_p=cfg.dropout_p,
+            ppm_pool_sizes=checkpoint_config.get("ppm_pool_sizes", (1, 2, 3, 6)),
+            coarse_channels=checkpoint_config.get("coarse_channels", 64),
+            refinement_channels=checkpoint_config.get("refinement_channels", 64),
+            dropout_p=checkpoint_config.get("dropout_p", 0.1),
+            refinement_head=checkpoint_config.get("refinement_head", "multiscale"),
+            prompt_gate_mode=checkpoint_config.get("prompt_gate_mode", "bidirectional"),
+            prompt_gate_strength=checkpoint_config.get("prompt_gate_strength", 0.5),
+            refine_h8_channels=checkpoint_config.get("refine_h8_channels", 96),
+            h4_skip_channels=checkpoint_config.get("h4_skip_channels", 32),
+            refine_h4_channels=checkpoint_config.get("refine_h4_channels", 64),
+            h2_skip_channels=checkpoint_config.get("h2_skip_channels", 16),
+            refine_h2_channels=checkpoint_config.get("refine_h2_channels", 32),
+            fine_output_channels=checkpoint_config.get("fine_output_channels", 24),
+            fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
         ).to(device)
     else:
         model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)
         
-    ckpt = load_checkpoint(args.checkpoint, model, map_location=device, weights_only=True)
+    load_checkpoint(args.checkpoint, model, map_location=device, weights_only=True)
     model.eval()
     logger.info(f"Model ({args.model}) loaded on {device}")
 
-    # Auto-detect task mode from checkpoint
-    checkpoint_config = ckpt.get("config", {})
-    task_mode = checkpoint_config.get("task_mode", "segmentation")
-    threshold = checkpoint_config.get("foreground_threshold", 0.5)
+    # Auto-detect threshold
+    threshold = checkpoint_config.get("best_validation_threshold", checkpoint_config.get("foreground_threshold", 0.5))
     logger.info(f"Auto-detected task mode: {task_mode}, threshold: {threshold}")
 
     input_path = Path(args.input)

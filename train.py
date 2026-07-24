@@ -54,7 +54,7 @@ from dataset import (
 from models import FastSCNN, FastSCNNSalient, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
-from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss
 from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
 from utils.scheduler import build_scheduler
@@ -253,9 +253,17 @@ def validate(
 ) -> Dict[str, float]:
     """Run validation. Returns loss + metric dict."""
     model.eval()
-    metrics.reset()
     running_loss = 0.0
     num_batches = 0
+
+    is_salient = (cfg.model == "fast_scnn_salient")
+    do_sweep = is_salient and getattr(cfg, "threshold_sweep", False)
+
+    if do_sweep:
+        thresholds = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
+        sweep_metrics = {t: SegmentationMetrics(num_classes=2) for t in thresholds}
+    else:
+        metrics.reset()
 
     for batch in dataloader:
         images = batch["image"].to(device, non_blocking=True)
@@ -263,14 +271,17 @@ def validate(
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             output = model(images)
-            if cfg.model == "fast_scnn_salient":
+            if is_salient:
                 targets = masks.unsqueeze(1).float()
                 losses = criterion(
                     coarse_logits=output["coarse_logits"],
                     fine_logits=output["fine_logits"],
                     targets=targets,
                 )
-                preds = (output["fine_logits"] > 0.0).squeeze(1).long()
+                if do_sweep:
+                    probs = torch.sigmoid(output["fine_logits"]).squeeze(1)
+                else:
+                    preds = (output["fine_logits"] > 0.0).squeeze(1).long()
             else:
                 losses = compute_total_loss(
                     criterion, output, masks,
@@ -281,7 +292,13 @@ def validate(
 
         running_loss += losses["total"].item()
         num_batches += 1
-        metrics.update(preds, masks)
+        
+        if do_sweep:
+            for t, m_obj in sweep_metrics.items():
+                preds_t = (probs >= t).long()
+                m_obj.update(preds_t, masks)
+        else:
+            metrics.update(preds, masks)
 
     # Gather metrics & loss across DDP processes if active
     import torch.distributed as dist
@@ -293,8 +310,38 @@ def validate(
     else:
         avg_loss = running_loss / max(num_batches, 1)
 
-    metrics.all_reduce()
-    metric_results = metrics.compute()
+    if do_sweep:
+        sweep_results = {}
+        best_t = 0.50
+        best_dice = -1.0
+        for t in thresholds:
+            m_obj = sweep_metrics[t]
+            m_obj.all_reduce()
+            res = m_obj.compute()
+            dice = res["foreground_dice"]
+            iou = res["foreground_iou"]
+            prec = res["precision"]
+            rec = res["recall"]
+            fpr = res["fp_rate"]
+            if os.environ.get("RANK", "0") == "0":
+                logger.info(
+                    f"Threshold: {t:.2f} | Dice: {dice:.4f} | IoU: {iou:.4f} | "
+                    f"Precision: {prec:.4f} | Recall: {rec:.4f} | FP Rate: {fpr:.4f}"
+                )
+            sweep_results[t] = res
+            if dice > best_dice:
+                best_dice = dice
+                best_t = t
+
+        if os.environ.get("RANK", "0") == "0":
+            logger.info(f"★ Best validation threshold selected: {best_t:.2f} with Dice {best_dice:.4f}")
+            
+        cfg.best_validation_threshold = best_t
+        metric_results = sweep_results[best_t]
+    else:
+        metrics.all_reduce()
+        metric_results = metrics.compute()
+
     metric_results["val_loss"] = avg_loss
     return metric_results
 
@@ -516,6 +563,16 @@ def run_smoke_test(cfg: Config) -> None:
             coarse_channels=cfg.coarse_channels,
             refinement_channels=cfg.refinement_channels,
             dropout_p=cfg.dropout_p,
+            refinement_head=cfg.refinement_head,
+            prompt_gate_mode=cfg.prompt_gate_mode,
+            prompt_gate_strength=cfg.prompt_gate_strength,
+            refine_h8_channels=cfg.refine_h8_channels,
+            h4_skip_channels=cfg.h4_skip_channels,
+            refine_h4_channels=cfg.refine_h4_channels,
+            h2_skip_channels=cfg.h2_skip_channels,
+            refine_h2_channels=cfg.refine_h2_channels,
+            fine_output_channels=cfg.fine_output_channels,
+            fine_dropout=cfg.fine_dropout,
         ).to(device)
     else:
         model = FastSCNN(num_classes=cfg.num_classes, aux=cfg.aux, dropout_p=cfg.dropout_p).to(device)
@@ -528,18 +585,21 @@ def run_smoke_test(cfg: Config) -> None:
     scaler = torch.amp.GradScaler(device=device.type) if use_amp else None
 
     if cfg.model == "fast_scnn_salient":
-        criterion = SalientSegmentationLoss(
-            lambda_coarse=cfg.salient_lambda_coarse,
-            lambda_fine=cfg.salient_lambda_fine,
-            lambda_boundary=cfg.salient_lambda_boundary,
-            coarse_bce_weight=cfg.salient_coarse_bce_weight,
-            coarse_dice_weight=cfg.salient_coarse_dice_weight,
-            fine_focal_weight=cfg.salient_fine_focal_weight,
-            fine_dice_weight=cfg.salient_fine_dice_weight,
-            focal_alpha=cfg.salient_focal_alpha,
-            focal_gamma=cfg.salient_focal_gamma,
-            pos_weight=cfg.salient_pos_weight,
-        )
+        if cfg.loss_profile == "precision_salient":
+            criterion = PrecisionSalientLoss(cfg)
+        else:
+            criterion = SalientSegmentationLoss(
+                lambda_coarse=cfg.salient_lambda_coarse,
+                lambda_fine=cfg.salient_lambda_fine,
+                lambda_boundary=cfg.salient_lambda_boundary,
+                coarse_bce_weight=cfg.salient_coarse_bce_weight,
+                coarse_dice_weight=cfg.salient_coarse_dice_weight,
+                fine_focal_weight=cfg.salient_fine_focal_weight,
+                fine_dice_weight=cfg.salient_fine_dice_weight,
+                focal_alpha=cfg.salient_focal_alpha,
+                focal_gamma=cfg.salient_focal_gamma,
+                pos_weight=cfg.salient_pos_weight,
+            )
     else:
         criterion = CombinedSegmentationLoss(
             ce_weight=cfg.ce_weight, dice_weight=cfg.dice_weight,
@@ -743,6 +803,16 @@ def train(cfg: Config) -> None:
             coarse_channels=cfg.coarse_channels,
             refinement_channels=cfg.refinement_channels,
             dropout_p=cfg.dropout_p,
+            refinement_head=cfg.refinement_head,
+            prompt_gate_mode=cfg.prompt_gate_mode,
+            prompt_gate_strength=cfg.prompt_gate_strength,
+            refine_h8_channels=cfg.refine_h8_channels,
+            h4_skip_channels=cfg.h4_skip_channels,
+            refine_h4_channels=cfg.refine_h4_channels,
+            h2_skip_channels=cfg.h2_skip_channels,
+            refine_h2_channels=cfg.refine_h2_channels,
+            fine_output_channels=cfg.fine_output_channels,
+            fine_dropout=cfg.fine_dropout,
         ).to(device)
     else:
         # For matting, standard FastSCNN outputs 1 channel and disables auxiliary heads
@@ -824,18 +894,21 @@ def train(cfg: Config) -> None:
             f"chunk_size={cfg.ddc_chunk_size}, downsample={cfg.ddc_downsample_factor}"
         )
     elif cfg.model == "fast_scnn_salient":
-        criterion = SalientSegmentationLoss(
-            lambda_coarse=cfg.salient_lambda_coarse,
-            lambda_fine=cfg.salient_lambda_fine,
-            lambda_boundary=cfg.salient_lambda_boundary,
-            coarse_bce_weight=cfg.salient_coarse_bce_weight,
-            coarse_dice_weight=cfg.salient_coarse_dice_weight,
-            fine_focal_weight=cfg.salient_fine_focal_weight,
-            fine_dice_weight=cfg.salient_fine_dice_weight,
-            focal_alpha=cfg.salient_focal_alpha,
-            focal_gamma=cfg.salient_focal_gamma,
-            pos_weight=cfg.salient_pos_weight,
-        ).to(device)
+        if cfg.loss_profile == "precision_salient":
+            criterion = PrecisionSalientLoss(cfg).to(device)
+        else:
+            criterion = SalientSegmentationLoss(
+                lambda_coarse=cfg.salient_lambda_coarse,
+                lambda_fine=cfg.salient_lambda_fine,
+                lambda_boundary=cfg.salient_lambda_boundary,
+                coarse_bce_weight=cfg.salient_coarse_bce_weight,
+                coarse_dice_weight=cfg.salient_coarse_dice_weight,
+                fine_focal_weight=cfg.salient_fine_focal_weight,
+                fine_dice_weight=cfg.salient_fine_dice_weight,
+                focal_alpha=cfg.salient_focal_alpha,
+                focal_gamma=cfg.salient_focal_gamma,
+                pos_weight=cfg.salient_pos_weight,
+            ).to(device)
         known_loss_fn = None
         ddc_loss_fn = None
     else:
@@ -950,11 +1023,10 @@ def train(cfg: Config) -> None:
                     f"SAD-T={val_results['sad_t']:.1f} MSE-T={val_results['mse_t']:.6f}"
                 )
             elif cfg.model == "fast_scnn_salient":
+                loss_str = " ".join([f"{k}={v:.4f}" for k, v in train_losses.items() if k != "total"])
                 logger.info(
                     f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
-                    f"Train loss={train_losses['total']:.4f} (Coarse={train_losses['coarse']:.4f} "
-                    f"Fine={train_losses['fine']:.4f} "
-                    f"Boundary={train_losses['boundary']:.4f}) | "
+                    f"Train loss={train_losses['total']:.4f} ({loss_str}) | "
                     f"Val loss={val_results['val_loss']:.4f} | "
                     f"PA={val_results['pixel_accuracy']:.4f} "
                     f"mIoU={val_results['miou']:.4f} "
@@ -962,6 +1034,12 @@ def train(cfg: Config) -> None:
                     f"FG_Dice={val_results['foreground_dice']:.4f} | "
                     f"LR={current_lr:.6f} | Best mIoU={best_miou:.4f}"
                 )
+                if "precision" in val_results:
+                    logger.info(
+                        f"  Metrics: Prec={val_results['precision']:.4f}  "
+                        f"Recall={val_results['recall']:.4f}  F1={val_results['f1']:.4f}  "
+                        f"FPR={val_results['fp_rate']:.4f}"
+                    )
                 for i, name in enumerate(["background", "foreground"]):
                     logger.info(f"  {name}: IoU={val_results['per_class_iou'][i]:.4f}  "
                                 f"Dice={val_results['per_class_dice'][i]:.4f}")
@@ -987,15 +1065,23 @@ def train(cfg: Config) -> None:
             if rank == 0:
                 history["train_loss"].append(train_losses["total"])
                 history["val_loss"].append(val_results["val_loss"])
-                if is_matting:
-                    history["coarse_known_loss"].append(train_losses["coarse_known"])
-                    history["fine_known_loss"].append(train_losses["fine_known"])
-                    history["ddc_loss"].append(train_losses["ddc"])
-                    history["mad"].append(val_results["mad"])
-                    history["mse"].append(val_results["mse"])
-                else:
+                for k, v in train_losses.items():
+                    if k != "total":
+                        hist_key = f"train_{k}"
+                        if hist_key not in history:
+                            history[hist_key] = [0.0] * epoch
+                        history[hist_key].append(v)
+                if not is_matting:
                     history["pixel_accuracy"].append(val_results["pixel_accuracy"])
                     history["miou"].append(val_results["miou"])
+                    for k in ["precision", "recall", "f1", "fp_rate", "fp_pixel_ratio"]:
+                        if k in val_results:
+                            if k not in history:
+                                history[k] = [0.0] * epoch
+                            history[k].append(val_results[k])
+                else:
+                    history["mad"].append(val_results["mad"])
+                    history["mse"].append(val_results["mse"])
                 history["foreground_iou"].append(val_results["foreground_iou"])
                 history["foreground_dice"].append(val_results["foreground_dice"])
                 history["learning_rate"].append(current_lr)
@@ -1004,23 +1090,18 @@ def train(cfg: Config) -> None:
             if rank == 0 and writer:
                 writer.add_scalar("Loss/train", train_losses["total"], epoch)
                 writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
-                if is_matting:
-                    writer.add_scalar("Loss/coarse_known", train_losses["coarse_known"], epoch)
-                    writer.add_scalar("Loss/fine_known", train_losses["fine_known"], epoch)
-                    writer.add_scalar("Loss/ddc", train_losses["ddc"], epoch)
-                    writer.add_scalar("Metrics/mad", val_results["mad"], epoch)
-                    writer.add_scalar("Metrics/mse", val_results["mse"], epoch)
-                elif cfg.model == "fast_scnn_salient":
-                    writer.add_scalar("Loss/coarse", train_losses["coarse"], epoch)
-                    writer.add_scalar("Loss/fine", train_losses["fine"], epoch)
-                    writer.add_scalar("Loss/boundary", train_losses["boundary"], epoch)
-                else:
-                    writer.add_scalar("Loss/aux_downsample", train_losses["aux_downsample"], epoch)
-                    writer.add_scalar("Loss/aux_global", train_losses["aux_global"], epoch)
+                for k, v in train_losses.items():
+                    if k != "total":
+                        writer.add_scalar(f"Loss/{k}", v, epoch)
                 if not is_matting:
                     writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
                     writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
+                    for k in ["precision", "recall", "f1", "fp_rate", "fp_pixel_ratio"]:
+                        if k in val_results:
+                            writer.add_scalar(f"Metrics/{k}", val_results[k], epoch)
                 else:
+                    writer.add_scalar("Metrics/mad", val_results["mad"], epoch)
+                    writer.add_scalar("Metrics/mse", val_results["mse"], epoch)
                     writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
                 writer.add_scalar("Metrics/foreground_iou", val_results["foreground_iou"], epoch)
                 writer.add_scalar("Metrics/foreground_dice", val_results["foreground_dice"], epoch)
@@ -1166,7 +1247,27 @@ def parse_args() -> argparse.Namespace:
 
     # DDC Matting specific arguments
     p.add_argument("--task-mode", choices=["segmentation", "ddc_matting"], default=None)
-    p.add_argument("--loss-profile", choices=["legacy", "legacy_salient", "ddc_matting"], default=None)
+    p.add_argument("--loss-profile", choices=["legacy", "legacy_salient", "ddc_matting", "precision_salient"], default=None)
+    
+    # Multiscale Fine Head & Precision Loss arguments
+    p.add_argument("--refinement-head", choices=["legacy_h8", "multiscale"], default=None,
+                   help="Refinement head architecture")
+    p.add_argument("--prompt-gate-mode", choices=["legacy_additive", "bidirectional"], default=None,
+                   help="Spatial prompt gating mode")
+    p.add_argument("--prompt-gate-strength", type=float, default=None,
+                   help="Strength of bidirectional spatial prompt gating")
+    p.add_argument("--tversky-fp-weight", type=float, default=None,
+                   help="False Positive penalty weight in Tversky Loss")
+    p.add_argument("--tversky-fn-weight", type=float, default=None,
+                   help="False Negative penalty weight in Tversky Loss")
+    p.add_argument("--boundary-kernel-size", type=int, default=None,
+                   help="Kernel size for Boundary Weighted BCE Loss")
+    p.add_argument("--boundary-extra-weight", type=float, default=None,
+                   help="Extra weight for boundary region in Boundary Weighted BCE Loss")
+    p.add_argument("--hard-negative-ratio", type=float, default=None,
+                   help="Top ratio of background pixels to mine in Hard Negative BCE Loss")
+    p.add_argument("--threshold-sweep", action="store_true", default=None,
+                   help="Run evaluation/validation across multiple threshold candidates")
     p.add_argument("--trimap-source", choices=["binary_mask", "file"], default=None)
     p.add_argument("--trimap-kernel-min", type=int, default=None)
     p.add_argument("--trimap-kernel-max", type=int, default=None)
@@ -1307,6 +1408,24 @@ def main() -> None:
         cfg.scheduler_milestones = args.scheduler_milestones
     if args.scheduler_gamma is not None:
         cfg.scheduler_gamma = args.scheduler_gamma
+    if args.refinement_head is not None:
+        cfg.refinement_head = args.refinement_head
+    if args.prompt_gate_mode is not None:
+        cfg.prompt_gate_mode = args.prompt_gate_mode
+    if args.prompt_gate_strength is not None:
+        cfg.prompt_gate_strength = args.prompt_gate_strength
+    if args.tversky_fp_weight is not None:
+        cfg.tversky_fp_weight = args.tversky_fp_weight
+    if args.tversky_fn_weight is not None:
+        cfg.tversky_fn_weight = args.tversky_fn_weight
+    if args.boundary_kernel_size is not None:
+        cfg.boundary_kernel_size = args.boundary_kernel_size
+    if args.boundary_extra_weight is not None:
+        cfg.boundary_extra_weight = args.boundary_extra_weight
+    if args.hard_negative_ratio is not None:
+        cfg.hard_negative_ratio = args.hard_negative_ratio
+    if args.threshold_sweep is not None:
+        cfg.threshold_sweep = args.threshold_sweep
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

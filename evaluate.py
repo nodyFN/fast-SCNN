@@ -57,6 +57,7 @@ def evaluate(
     num_vis_samples: int = 8,
     allow_threshold: bool = False,
     task_mode: str | None = None,
+    threshold_sweep: bool = False,
 ) -> None:
     cfg = Config()
     cfg.model = model_name
@@ -109,10 +110,20 @@ def evaluate(
     # 3. Model Setup
     if cfg.model == "fast_scnn_salient":
         model = FastSCNNSalient(
-            ppm_pool_sizes=cfg.ppm_pool_sizes,
-            coarse_channels=cfg.coarse_channels,
-            refinement_channels=cfg.refinement_channels,
-            dropout_p=cfg.dropout_p,
+            ppm_pool_sizes=checkpoint_config.get("ppm_pool_sizes", (1, 2, 3, 6)),
+            coarse_channels=checkpoint_config.get("coarse_channels", 64),
+            refinement_channels=checkpoint_config.get("refinement_channels", 64),
+            dropout_p=checkpoint_config.get("dropout_p", 0.1),
+            refinement_head=checkpoint_config.get("refinement_head", "multiscale"),
+            prompt_gate_mode=checkpoint_config.get("prompt_gate_mode", "bidirectional"),
+            prompt_gate_strength=checkpoint_config.get("prompt_gate_strength", 0.5),
+            refine_h8_channels=checkpoint_config.get("refine_h8_channels", 96),
+            h4_skip_channels=checkpoint_config.get("h4_skip_channels", 32),
+            refine_h4_channels=checkpoint_config.get("refine_h4_channels", 64),
+            h2_skip_channels=checkpoint_config.get("h2_skip_channels", 16),
+            refine_h2_channels=checkpoint_config.get("refine_h2_channels", 32),
+            fine_output_channels=checkpoint_config.get("fine_output_channels", 24),
+            fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
         ).to(device)
     else:
         model = FastSCNN(num_classes=cfg.num_classes, aux=True).to(device)
@@ -131,18 +142,23 @@ def evaluate(
             has_alpha_gt=False,  # Binary mask reference
         )
     elif cfg.model == "fast_scnn_salient":
-        criterion = SalientSegmentationLoss(
-            lambda_coarse=cfg.salient_lambda_coarse,
-            lambda_fine=cfg.salient_lambda_fine,
-            lambda_boundary=cfg.salient_lambda_boundary,
-            coarse_bce_weight=cfg.salient_coarse_bce_weight,
-            coarse_dice_weight=cfg.salient_coarse_dice_weight,
-            fine_focal_weight=cfg.salient_fine_focal_weight,
-            fine_dice_weight=cfg.salient_fine_dice_weight,
-            focal_alpha=cfg.salient_focal_alpha,
-            focal_gamma=cfg.salient_focal_gamma,
-            pos_weight=cfg.salient_pos_weight,
-        ).to(device)
+        loss_profile = checkpoint_config.get("loss_profile", "legacy_salient")
+        if loss_profile == "precision_salient":
+            from utils.losses import PrecisionSalientLoss
+            criterion = PrecisionSalientLoss(cfg).to(device)
+        else:
+            criterion = SalientSegmentationLoss(
+                lambda_coarse=cfg.salient_lambda_coarse,
+                lambda_fine=cfg.salient_lambda_fine,
+                lambda_boundary=cfg.salient_lambda_boundary,
+                coarse_bce_weight=cfg.salient_coarse_bce_weight,
+                coarse_dice_weight=cfg.salient_coarse_dice_weight,
+                fine_focal_weight=cfg.salient_fine_focal_weight,
+                fine_dice_weight=cfg.salient_fine_dice_weight,
+                focal_alpha=cfg.salient_focal_alpha,
+                focal_gamma=cfg.salient_focal_gamma,
+                pos_weight=cfg.salient_pos_weight,
+            ).to(device)
         metrics_obj = SegmentationMetrics(2, cfg.ignore_index)
     else:
         criterion = CombinedSegmentationLoss(
@@ -154,6 +170,15 @@ def evaluate(
     total_loss = 0.0
     num_batches = 0
     vis_saved = False
+
+    is_salient = (cfg.model == "fast_scnn_salient")
+    do_sweep = is_salient and threshold_sweep
+
+    if do_sweep:
+        thresholds = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
+        sweep_metrics = {t: SegmentationMetrics(2, cfg.ignore_index) for t in thresholds}
+    else:
+        metrics_obj.reset()
 
     # 5. Evaluation Loop
     with torch.inference_mode():
@@ -172,21 +197,31 @@ def evaluate(
                 gt = masks.unsqueeze(1).float()
                 metrics_obj.update(fine_alpha, gt, trimap=trimaps)
             else:
-                if cfg.model == "fast_scnn_salient":
+                if is_salient:
                     targets = masks.unsqueeze(1).float()
                     loss_dict = criterion(
                         coarse_logits=logits["coarse_logits"],
                         fine_logits=logits["fine_logits"],
                         targets=targets,
                     )
-                    preds = (logits["fine_logits"] > 0.0).squeeze(1).long()
+                    if do_sweep:
+                        probs = logits["fine_prob"].squeeze(1)
+                    else:
+                        best_t = checkpoint_config.get("best_validation_threshold", 0.5)
+                        preds = (logits["fine_prob"] >= best_t).squeeze(1).long()
                 else:
                     loss_dict = compute_total_loss(criterion, logits, masks, 0.0, 0.0)
                     preds = logits
 
                 total_loss += loss_dict["total"].item()
                 num_batches += 1
-                metrics_obj.update(preds, masks)
+                
+                if do_sweep:
+                    for t, m_obj in sweep_metrics.items():
+                        preds_t = (probs >= t).long()
+                        m_obj.update(preds_t, masks)
+                else:
+                    metrics_obj.update(preds, masks)
 
             # Save visualization for first batch
             if save_vis and not vis_saved:
@@ -202,8 +237,9 @@ def evaluate(
                         threshold=checkpoint_config.get("foreground_threshold", 0.5),
                     )
                 else:
-                    if cfg.model == "fast_scnn_salient":
-                        preds_vis = (logits["fine_logits"] > 0.0).squeeze(1).long()
+                    if is_salient:
+                        best_t = checkpoint_config.get("best_validation_threshold", 0.5)
+                        preds_vis = (logits["fine_prob"] >= best_t).squeeze(1).long()
                         probs_vis = logits["fine_prob"].squeeze(1)
                     else:
                         preds_vis = logits.argmax(dim=1)
@@ -216,7 +252,21 @@ def evaluate(
                 vis_saved = True
 
     # 6. Report and Save Results
-    results = metrics_obj.compute()
+    if do_sweep:
+        logger.info("=== Threshold Sweep Results ===")
+        for t in thresholds:
+            m_obj = sweep_metrics[t]
+            res = m_obj.compute()
+            logger.info(
+                f"Threshold: {t:.2f} | Dice: {res['foreground_dice']:.4f} | IoU: {res['foreground_iou']:.4f} | "
+                f"Precision: {res['precision']:.4f} | Recall: {res['recall']:.4f} | FP Rate: {res['fp_rate']:.4f}"
+            )
+        best_t = checkpoint_config.get("best_validation_threshold", 0.5)
+        best_t_idx = thresholds.index(best_t) if best_t in thresholds else thresholds.index(0.5)
+        results = sweep_metrics[thresholds[best_t_idx]].compute()
+        logger.info(f"★ Reporting metrics for loaded best threshold: {thresholds[best_t_idx]:.2f}")
+    else:
+        results = metrics_obj.compute()
     results["avg_loss"] = total_loss / max(num_batches, 1)
 
     # Print
@@ -246,6 +296,12 @@ def evaluate(
         print(f"  Foreground IoU  : {results['foreground_iou']:.4f}")
         print(f"  Foreground Dice : {results['foreground_dice']:.4f}")
         print(f"  Mean Dice       : {results['mean_dice']:.4f}")
+        if "precision" in results:
+            print(f"  Precision       : {results['precision']:.4f}")
+            print(f"  Recall          : {results['recall']:.4f}")
+            print(f"  F1 (FG Dice)    : {results['f1']:.4f}")
+            print(f"  False Pos Rate  : {results['fp_rate']:.4f}")
+            print(f"  FP Pixel Ratio  : {results['fp_pixel_ratio']:.4f}")
         class_names = ["background", "foreground"] if cfg.model == "fast_scnn_salient" else cfg.class_names
         for i, name in enumerate(class_names):
             print(f"  {name:15s} : IoU={results['per_class_iou'][i]:.4f}  "
@@ -290,6 +346,8 @@ def main() -> None:
                    help="Allow thresholding grayscale masks to binary (0/1)")
     p.add_argument("--task-mode", choices=["segmentation", "ddc_matting"], default=None,
                    help="Task mode for evaluation (default: auto-detected from checkpoint)")
+    p.add_argument("--threshold-sweep", action="store_true",
+                   help="Evaluate validation metrics across multiple threshold candidates")
     args = p.parse_args()
 
     evaluate(
@@ -307,6 +365,7 @@ def main() -> None:
         num_vis_samples=args.num_vis_samples,
         allow_threshold=args.allow_threshold,
         task_mode=args.task_mode,
+        threshold_sweep=args.threshold_sweep,
     )
 
 

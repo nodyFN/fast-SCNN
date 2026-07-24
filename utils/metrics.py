@@ -143,6 +143,17 @@ class SegmentationMetrics:
         mean_dice = sum(valid_dice) / len(valid_dice) if valid_dice else 0.0
         fg_dice = per_class_dice[1] if self.num_classes > 1 else float("nan")
 
+        tn = cm[0, 0].item() if self.num_classes > 1 else 0.0
+        fp = cm[0, 1].item() if self.num_classes > 1 else 0.0
+        fn = cm[1, 0].item() if self.num_classes > 1 else 0.0
+        tp = cm[1, 1].item() if self.num_classes > 1 else 0.0
+
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2.0 * tp / max(2.0 * tp + fp + fn, 1.0)
+        fp_rate = fp / max(fp + tn, 1.0)
+        fp_pixel_ratio = fp / max(tp + fp + fn + tn, 1.0)
+
         return {
             "pixel_accuracy": pixel_accuracy,
             "per_class_iou": per_class_iou,
@@ -151,5 +162,10 @@ class SegmentationMetrics:
             "per_class_dice": per_class_dice,
             "mean_dice": mean_dice,
             "foreground_dice": fg_dice,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "fp_rate": fp_rate,
+            "fp_pixel_ratio": fp_pixel_ratio,
             "confusion_matrix": self.confusion_matrix.tolist(),
         }

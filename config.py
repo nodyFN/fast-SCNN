@@ -153,10 +153,44 @@ class Config:
     salient_focal_gamma: float = 2.0
     salient_pos_weight: Optional[float] = None
 
+    # ── Multiscale Fine Head & Gating ────────────────────────────────
+    refinement_head: str = "multiscale"
+    prompt_gate_mode: str = "bidirectional"
+    prompt_gate_strength: float = 0.5
+
+    refine_h8_channels: int = 96
+    h4_skip_channels: int = 32
+    refine_h4_channels: int = 64
+    h2_skip_channels: int = 16
+    refine_h2_channels: int = 32
+    fine_output_channels: int = 24
+    fine_dropout: float = 0.1
+
+    # ── Precision-Oriented Loss Configuration ─────────────────────────
+    coarse_bce_weight: float = 1.0
+    coarse_dice_weight: float = 1.0
+
+    fine_bce_weight: float = 0.5
+    fine_tversky_weight: float = 1.0
+    fine_boundary_weight: float = 0.25
+    fine_hard_negative_weight: float = 0.25
+    fine_focal_weight: float = 0.0
+    fine_sobel_weight: float = 0.0
+
+    tversky_fp_weight: float = 0.7
+    tversky_fn_weight: float = 0.3
+    tversky_smooth: float = 1.0
+
+    boundary_kernel_size: int = 7
+    boundary_extra_weight: float = 4.0
+
+    hard_negative_ratio: float = 0.10
+    hard_negative_min_pixels: int = 256
+
     # ── DDC Alpha-Free Matting ────────────────────────────────────────
     # Based on: "Training Matting Models without Alpha Labels"
     task_mode: str = "segmentation"   # "segmentation" | "ddc_matting"
-    loss_profile: str = "legacy"      # "legacy" | "legacy_salient" | "ddc_matting"
+    loss_profile: str = "precision_salient"      # "legacy" | "legacy_salient" | "ddc_matting" | "precision_salient"
 
     # Trimap
     trimap_source: str = "binary_mask"  # "binary_mask" | "file"
@@ -185,6 +219,8 @@ class Config:
 
     # Matting evaluation
     foreground_threshold: float = 0.5
+    threshold_sweep: bool = False
+    best_validation_threshold: float = 0.5
 
     # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None

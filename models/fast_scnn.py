@@ -208,6 +208,17 @@ class LearningToDownsample(nn.Module):
         self.dsconv1 = DepthwiseSeparableConv(32, 48, stride=2)
         self.dsconv2 = DepthwiseSeparableConv(48, 64, stride=2)
 
+    def forward_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward features and return intermediate outputs at H/2, H/4, and H/8."""
+        feat_h2 = self.conv(x)
+        feat_h4 = self.dsconv1(feat_h2)
+        feat_h8_skip = self.dsconv2(feat_h4)
+        return {
+            "feat_h2": feat_h2,
+            "feat_h4": feat_h4,
+            "feat_h8_skip": feat_h8_skip,
+        }
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
         x = self.dsconv1(x)

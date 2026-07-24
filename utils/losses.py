@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.precision_losses import BinaryTverskyLoss, BoundaryWeightedBCELoss, HardNegativeBCELoss
 
 
 class CrossEntropySegLoss(nn.Module):
@@ -605,4 +606,157 @@ class SalientSegmentationLoss(nn.Module):
             "coarse_dice": coarse_dice,
             "fine_focal": fine_focal,
             "fine_dice": fine_dice,
+        }
+
+
+class PrecisionSalientLoss(nn.Module):
+    """Upgraded Loss for FastSCNNSalient.
+
+    Total loss:
+        L_total = lambda_coarse * L_coarse + lambda_fine * L_fine
+
+    Where:
+        L_coarse = coarse_bce_weight * BCE + coarse_dice_weight * Dice
+        L_fine   = fine_bce_weight * BCE
+                 + fine_tversky_weight * Tversky
+                 + fine_boundary_weight * BoundaryWeightedBCE
+                 + fine_hard_negative_weight * HardNegativeBCE
+                 + fine_focal_weight * Focal
+                 + fine_sobel_weight * Sobel
+    """
+    def __init__(self, cfg) -> None:
+        super().__init__()
+        self.lambda_coarse = getattr(cfg, "salient_lambda_coarse", 1.0)
+        self.lambda_fine = getattr(cfg, "salient_lambda_fine", 1.0)
+
+        self.coarse_bce_w = getattr(cfg, "coarse_bce_weight", 1.0)
+        self.coarse_dice_w = getattr(cfg, "coarse_dice_weight", 1.0)
+
+        self.fine_bce_w = getattr(cfg, "fine_bce_weight", 0.5)
+        self.fine_tversky_w = getattr(cfg, "fine_tversky_weight", 1.0)
+        self.fine_boundary_w = getattr(cfg, "fine_boundary_weight", 0.25)
+        self.fine_hard_negative_w = getattr(cfg, "fine_hard_negative_weight", 0.25)
+        self.fine_focal_w = getattr(cfg, "fine_focal_weight", 0.0)
+        self.fine_sobel_w = getattr(cfg, "fine_sobel_weight", 0.0)
+
+        # Instantiate sub-losses
+        self.binary_dice = BinaryDiceLoss()
+        self.binary_tversky = BinaryTverskyLoss(
+            fp_weight=getattr(cfg, "tversky_fp_weight", 0.7),
+            fn_weight=getattr(cfg, "tversky_fn_weight", 0.3),
+            smooth=getattr(cfg, "tversky_smooth", 1.0),
+        )
+        self.boundary_weighted_bce = BoundaryWeightedBCELoss(
+            boundary_kernel_size=getattr(cfg, "boundary_kernel_size", 7),
+            boundary_extra_weight=getattr(cfg, "boundary_extra_weight", 4.0),
+        )
+        self.hard_negative_bce = HardNegativeBCELoss(
+            hard_negative_ratio=getattr(cfg, "hard_negative_ratio", 0.10),
+            hard_negative_min_pixels=getattr(cfg, "hard_negative_min_pixels", 256),
+        )
+        self.binary_focal = BinaryFocalLoss(
+            alpha=getattr(cfg, "salient_focal_alpha", 0.25),
+            gamma=getattr(cfg, "salient_focal_gamma", 2.0),
+        )
+        self.sobel_boundary = SobelBoundaryLoss()
+
+        # Register buffer for pos_weight if any
+        pos_weight = getattr(cfg, "salient_pos_weight", None)
+        self.register_buffer(
+            "pos_weight",
+            torch.tensor([pos_weight], dtype=torch.float32)
+            if pos_weight is not None
+            else None,
+        )
+
+    def forward(
+        self,
+        coarse_logits: torch.Tensor,
+        fine_logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        targets_float = targets.float()
+        zero = torch.tensor(0.0, device=coarse_logits.device)
+
+        # 1. Coarse Loss
+        pw = self.pos_weight
+        if pw is not None:
+            pw = pw.to(coarse_logits.device)
+
+        coarse_bce = (
+            F.binary_cross_entropy_with_logits(
+                coarse_logits, targets_float, pos_weight=pw,
+            )
+            if self.coarse_bce_w > 0
+            else zero
+        )
+        coarse_dice = (
+            self.binary_dice(coarse_logits, targets_float)
+            if self.coarse_dice_w > 0
+            else zero
+        )
+        coarse_loss = (
+            self.coarse_bce_w * coarse_bce
+            + self.coarse_dice_w * coarse_dice
+        )
+
+        # 2. Fine Loss
+        fine_bce = (
+            F.binary_cross_entropy_with_logits(
+                fine_logits, targets_float, pos_weight=pw,
+            )
+            if self.fine_bce_w > 0
+            else zero
+        )
+        fine_tversky = (
+            self.binary_tversky(fine_logits, targets_float)
+            if self.fine_tversky_w > 0
+            else zero
+        )
+        fine_boundary_bce = (
+            self.boundary_weighted_bce(fine_logits, targets)
+            if self.fine_boundary_w > 0
+            else zero
+        )
+        fine_hard_negative = (
+            self.hard_negative_bce(fine_logits, targets)
+            if self.fine_hard_negative_w > 0
+            else zero
+        )
+        fine_focal = (
+            self.binary_focal(fine_logits, targets_float)
+            if self.fine_focal_w > 0
+            else zero
+        )
+        fine_sobel = (
+            self.sobel_boundary(fine_logits, targets_float)
+            if self.fine_sobel_w > 0
+            else zero
+        )
+
+        fine_loss = (
+            self.fine_bce_w * fine_bce
+            + self.fine_tversky_w * fine_tversky
+            + self.fine_boundary_w * fine_boundary_bce
+            + self.fine_hard_negative_w * fine_hard_negative
+            + self.fine_focal_w * fine_focal
+            + self.fine_sobel_w * fine_sobel
+        )
+
+        # 3. Total Loss
+        total = (
+            self.lambda_coarse * coarse_loss
+            + self.lambda_fine * fine_loss
+        )
+
+        return {
+            "total": total,
+            "coarse_total": coarse_loss,
+            "coarse_bce": coarse_bce,
+            "coarse_dice": coarse_dice,
+            "fine_total": fine_loss,
+            "fine_bce": fine_bce,
+            "fine_tversky": fine_tversky,
+            "fine_boundary_bce": fine_boundary_bce,
+            "fine_hard_negative": fine_hard_negative,
         }

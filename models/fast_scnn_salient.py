@@ -101,6 +101,35 @@ class SharedFastSCNNBackbone(nn.Module):
             high_channels=64, low_channels=128, out_channels=128,
         )
 
+    def forward_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Single-pass multiscale feature extraction.
+
+        Parameters
+        ----------
+        x : [B, 3, H, W]
+
+        Returns
+        -------
+        Dict containing:
+            feature_h2 : [B, 32, H/2, W/2]
+            feature_h4 : [B, 48, H/4, W/4]
+            feature_h8 : [B, 128, H/8, W/8]
+        """
+        ltd_feats = self.learning_to_downsample.forward_features(x)
+        feat_h2 = ltd_feats["feat_h2"]
+        feat_h4 = ltd_feats["feat_h4"]
+        ltd_out = ltd_feats["feat_h8_skip"]
+
+        gfe_out = self.global_feature_extractor(ltd_out)
+        ppm_out = self.ppm(gfe_out)
+        feat_h8 = self.ffm(high_res=ltd_out, low_res=ppm_out)
+
+        return {
+            "feature_h2": feat_h2,
+            "feature_h4": feat_h4,
+            "feature_h8": feat_h8,
+        }
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Single-pass feature extraction.
 
@@ -178,41 +207,19 @@ class CoarseHead(nn.Module):
 # ===========================================================================
 
 
-class RefinementHead(nn.Module):
-    """Second decoder — precision refinement with spatial attention.
-
-    Pipeline::
-
-        1. Spatial Attention:
-           f_attended = F_shared + F_shared * coarse_prompt   (broadcasting)
-
-        2. Channel Concatenation:
-           refinement_input = cat([f_attended, coarse_prompt], dim=1)
-           → C + 1 channels (default 129)
-
-        3. Convolution Stack:
-           1×1 ConvBNReLU  (C+1) → refinement_channels
-           3×3 DSConv      refinement_channels → refinement_channels
-           Dropout (optional)
-           1×1 Conv         refinement_channels → 1
-
-    Parameters
-    ----------
-    in_channels : int
-        Channel count of shared feature (default 128).
-    refinement_channels : int
-        Intermediate channel width (default 64).
-    dropout_p : float
-        Dropout probability (default 0.1).
-    """
-
+class LegacyRefinementHead(nn.Module):
+    """Legacy H/8 refinement head for backward compatibility."""
     def __init__(
         self,
         in_channels: int = 128,
         refinement_channels: int = 64,
         dropout_p: float = 0.1,
+        prompt_gate_mode: str = "legacy_additive",
+        prompt_gate_strength: float = 0.5,
     ) -> None:
         super().__init__()
+        self.prompt_gate_mode = prompt_gate_mode
+        self.prompt_gate_strength = prompt_gate_strength
         # 1×1 projection: (C + 1) → refinement_channels
         self.proj = ConvBNReLU(
             in_channels + 1, refinement_channels,
@@ -231,21 +238,12 @@ class RefinementHead(nn.Module):
         shared_feature: torch.Tensor,
         coarse_prompt: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        shared_feature : [B, C, H_s, W_s]
-            Feature fusion output (gradients flow through here).
-        coarse_prompt : [B, 1, H_s, W_s]
-            Detached coarse probability (requires_grad=False).
-
-        Returns
-        -------
-        fine_logits_lowres : [B, 1, H_s, W_s]
-        """
-        # Spatial Attention: F_attended = F_shared + F_shared * coarse_prompt
-        # Uses broadcasting: [B, C, H, W] * [B, 1, H, W] → [B, C, H, W]
-        f_attended = shared_feature + shared_feature * coarse_prompt
+        # Spatial Gating
+        if self.prompt_gate_mode == "bidirectional":
+            gate = 1.0 + self.prompt_gate_strength * (2.0 * coarse_prompt - 1.0)
+            f_attended = shared_feature * gate
+        else:
+            f_attended = shared_feature + shared_feature * coarse_prompt
 
         # Channel concatenation: [B, C, H, W] + [B, 1, H, W] → [B, C+1, H, W]
         refinement_input = torch.cat([f_attended, coarse_prompt], dim=1)
@@ -255,6 +253,132 @@ class RefinementHead(nn.Module):
         x = self.dsconv(x)
         x = self.dropout(x)
         return self.conv(x)
+
+
+# Keep RefinementHead as alias for legacy code
+RefinementHead = LegacyRefinementHead
+
+
+class MultiscaleRefinementHead(nn.Module):
+    """Upgrade Decoder — multi-scale feature refinement leveraging H/2, H/4, and H/8 features."""
+    def __init__(
+        self,
+        in_channels: int = 128,
+        feature_h4_channels: int = 48,
+        feature_h2_channels: int = 32,
+        refine_h8_channels: int = 96,
+        h4_skip_channels: int = 32,
+        refine_h4_channels: int = 64,
+        h2_skip_channels: int = 16,
+        refine_h2_channels: int = 32,
+        fine_output_channels: int = 24,
+        fine_dropout: float = 0.1,
+        prompt_gate_mode: str = "bidirectional",
+        prompt_gate_strength: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.prompt_gate_mode = prompt_gate_mode
+        self.prompt_gate_strength = prompt_gate_strength
+
+        # H/8 Block: Concat(F_attended, coarse_prompt) -> (in_channels + 1) to refine_h8_channels
+        self.h8_proj = ConvBNReLU(
+            in_channels + 1, refine_h8_channels,
+            kernel_size=1, stride=1, padding=0,
+        )
+        self.h8_dsconv = DepthwiseSeparableConv(
+            refine_h8_channels, refine_h8_channels, stride=1,
+        )
+
+        # H/4 Skip Fusion
+        self.h4_skip_proj = ConvBNReLU(
+            feature_h4_channels, h4_skip_channels,
+            kernel_size=1, stride=1, padding=0,
+        )
+        self.h4_fusion_proj = ConvBNReLU(
+            refine_h8_channels + h4_skip_channels, refine_h4_channels,
+            kernel_size=1, stride=1, padding=0,
+        )
+        self.h4_dsconv = DepthwiseSeparableConv(
+            refine_h4_channels, refine_h4_channels, stride=1,
+        )
+
+        # H/2 Skip Fusion
+        self.h2_skip_proj = ConvBNReLU(
+            feature_h2_channels, h2_skip_channels,
+            kernel_size=1, stride=1, padding=0,
+        )
+        self.h2_fusion_proj = ConvBNReLU(
+            refine_h4_channels + h2_skip_channels, refine_h2_channels,
+            kernel_size=1, stride=1, padding=0,
+        )
+        self.h2_dsconv = DepthwiseSeparableConv(
+            refine_h2_channels, refine_h2_channels, stride=1,
+        )
+
+        # Full-resolution Output Block
+        self.out_conv = ConvBNReLU(
+            refine_h2_channels, fine_output_channels,
+            kernel_size=3, stride=1, padding=1,
+        )
+        self.dropout = nn.Dropout2d(p=fine_dropout) if fine_dropout > 0 else nn.Identity()
+        self.pred_conv = nn.Conv2d(fine_output_channels, 1, kernel_size=1)
+
+    def forward(
+        self,
+        feature_h8: torch.Tensor,
+        feature_h4: torch.Tensor,
+        feature_h2: torch.Tensor,
+        coarse_prompt: torch.Tensor,
+        input_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        # Spatial Attention Gating on feature_h8
+        if self.prompt_gate_mode == "bidirectional":
+            gate = 1.0 + self.prompt_gate_strength * (2.0 * coarse_prompt - 1.0)
+            f_attended = feature_h8 * gate
+        else:
+            f_attended = feature_h8 + feature_h8 * coarse_prompt
+
+        # H/8 Block
+        x = torch.cat([f_attended, coarse_prompt], dim=1)
+        x = self.h8_proj(x)
+        x = self.h8_dsconv(x)
+
+        # H/4 Skip Fusion
+        x = F.interpolate(
+            x,
+            size=feature_h4.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        h4_skip = self.h4_skip_proj(feature_h4)
+        x = torch.cat([x, h4_skip], dim=1)
+        x = self.h4_fusion_proj(x)
+        x = self.h4_dsconv(x)
+
+        # H/2 Skip Fusion
+        x = F.interpolate(
+            x,
+            size=feature_h2.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        h2_skip = self.h2_skip_proj(feature_h2)
+        x = torch.cat([x, h2_skip], dim=1)
+        x = self.h2_fusion_proj(x)
+        x = self.h2_dsconv(x)
+
+        # Full-resolution Output
+        x = F.interpolate(
+            x,
+            size=input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        x = self.out_conv(x)
+        x = self.dropout(x)
+        fine_logits = self.pred_conv(x)
+
+        return fine_logits
 
 
 # ===========================================================================
@@ -284,16 +408,12 @@ class FastSCNNSalient(nn.Module):
         Intermediate channels in RefinementHead (default 64).
     dropout_p : float
         Dropout probability for both heads (default 0.1).
-
-    Returns (forward)
-    -----------------
-    dict with keys:
-        coarse_logits        : [B, 1, H, W]
-        coarse_prob          : [B, 1, H, W]
-        fine_logits          : [B, 1, H, W]
-        fine_prob            : [B, 1, H, W]
-        coarse_logits_lowres : [B, 1, H_s, W_s]
-        coarse_prompt        : [B, 1, H_s, W_s]  (requires_grad=False)
+    refinement_head : str
+        "legacy_h8" | "multiscale" (default "multiscale").
+    prompt_gate_mode : str
+        "legacy_additive" | "bidirectional" (default "bidirectional").
+    prompt_gate_strength : float
+        Strength of bidirectional spatial gating (default 0.5).
     """
 
     def __init__(
@@ -302,6 +422,16 @@ class FastSCNNSalient(nn.Module):
         coarse_channels: int = 64,
         refinement_channels: int = 64,
         dropout_p: float = 0.1,
+        refinement_head: str = "multiscale",
+        prompt_gate_mode: str = "bidirectional",
+        prompt_gate_strength: float = 0.5,
+        refine_h8_channels: int = 96,
+        h4_skip_channels: int = 32,
+        refine_h4_channels: int = 64,
+        h2_skip_channels: int = 16,
+        refine_h2_channels: int = 32,
+        fine_output_channels: int = 24,
+        fine_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.backbone = SharedFastSCNNBackbone(
@@ -312,11 +442,32 @@ class FastSCNNSalient(nn.Module):
             coarse_channels=coarse_channels,
             dropout_p=dropout_p,
         )
-        self.refinement_head = RefinementHead(
-            in_channels=128,
-            refinement_channels=refinement_channels,
-            dropout_p=dropout_p,
-        )
+        self.refinement_head_type = refinement_head
+        if refinement_head == "legacy_h8":
+            self.refinement_head = LegacyRefinementHead(
+                in_channels=128,
+                refinement_channels=refinement_channels,
+                dropout_p=dropout_p,
+                prompt_gate_mode=prompt_gate_mode,
+                prompt_gate_strength=prompt_gate_strength,
+            )
+        elif refinement_head == "multiscale":
+            self.refinement_head = MultiscaleRefinementHead(
+                in_channels=128,
+                feature_h4_channels=48,
+                feature_h2_channels=32,
+                refine_h8_channels=refine_h8_channels,
+                h4_skip_channels=h4_skip_channels,
+                refine_h4_channels=refine_h4_channels,
+                h2_skip_channels=h2_skip_channels,
+                refine_h2_channels=refine_h2_channels,
+                fine_output_channels=fine_output_channels,
+                fine_dropout=fine_dropout,
+                prompt_gate_mode=prompt_gate_mode,
+                prompt_gate_strength=prompt_gate_strength,
+            )
+        else:
+            raise ValueError(f"Unknown refinement_head: {refinement_head}")
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -335,8 +486,16 @@ class FastSCNNSalient(nn.Module):
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         input_size = x.shape[-2:]  # (H, W)
 
-        # ── Shared Backbone (executed ONCE) ───────────────────────────
-        shared_feature = self.backbone(x)  # [B, 128, H/8, W/8]
+        if self.refinement_head_type == "multiscale":
+            # ── Shared Backbone (executed ONCE) ───────────────────────────
+            feats = self.backbone.forward_features(x)
+            shared_feature = feats["feature_h8"]
+            feature_h4 = feats["feature_h4"]
+            feature_h2 = feats["feature_h2"]
+        else:
+            shared_feature = self.backbone(x)
+            feature_h4 = None
+            feature_h2 = None
 
         # ── Coarse Head ───────────────────────────────────────────────
         coarse_logits_lowres = self.coarse_head(shared_feature)
@@ -350,11 +509,23 @@ class FastSCNNSalient(nn.Module):
         coarse_prompt = coarse_prob_lowres.detach()  # requires_grad=False
 
         # ── Refinement Head ───────────────────────────────────────────
-        fine_logits_lowres = self.refinement_head(
-            shared_feature, coarse_prompt,
-        )  # [B, 1, H/8, W/8]
+        if self.refinement_head_type == "multiscale":
+            fine_logits = self.refinement_head(
+                shared_feature, feature_h4, feature_h2, coarse_prompt, input_size
+            )
+        else:
+            fine_logits_lowres = self.refinement_head(
+                shared_feature, coarse_prompt,
+            )  # [B, 1, H/8, W/8]
+            # ── Upsample legacy fine logits to full resolution ──────────
+            fine_logits = F.interpolate(
+                fine_logits_lowres,
+                size=input_size,
+                mode="bilinear",
+                align_corners=False,
+            )
 
-        # ── Upsample to full resolution ───────────────────────────────
+        # ── Upsample coarse logits to full resolution ──────────────────
         coarse_logits = F.interpolate(
             coarse_logits_lowres,
             size=input_size,
@@ -362,13 +533,6 @@ class FastSCNNSalient(nn.Module):
             align_corners=False,
         )
         coarse_prob = torch.sigmoid(coarse_logits)
-
-        fine_logits = F.interpolate(
-            fine_logits_lowres,
-            size=input_size,
-            mode="bilinear",
-            align_corners=False,
-        )
         fine_prob = torch.sigmoid(fine_logits)
 
         return {

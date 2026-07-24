@@ -79,16 +79,28 @@ def export_onnx(
 
     device = torch.device(device_str)
 
-    # Config to access defaults
-    cfg = Config()
+    checkpoint_config = {}
+    if checkpoint_path:
+        ckpt_meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_config = ckpt_meta.get("config", {})
 
     # Build model (aux=True to load all weights, then wrap for export)
     if model_name == "fast_scnn_salient":
         model = FastSCNNSalient(
-            ppm_pool_sizes=cfg.ppm_pool_sizes,
-            coarse_channels=cfg.coarse_channels,
-            refinement_channels=cfg.refinement_channels,
-            dropout_p=cfg.dropout_p,
+            ppm_pool_sizes=checkpoint_config.get("ppm_pool_sizes", (1, 2, 3, 6)),
+            coarse_channels=checkpoint_config.get("coarse_channels", 64),
+            refinement_channels=checkpoint_config.get("refinement_channels", 64),
+            dropout_p=checkpoint_config.get("dropout_p", 0.1),
+            refinement_head=checkpoint_config.get("refinement_head", "multiscale"),
+            prompt_gate_mode=checkpoint_config.get("prompt_gate_mode", "bidirectional"),
+            prompt_gate_strength=checkpoint_config.get("prompt_gate_strength", 0.5),
+            refine_h8_channels=checkpoint_config.get("refine_h8_channels", 96),
+            h4_skip_channels=checkpoint_config.get("h4_skip_channels", 32),
+            refine_h4_channels=checkpoint_config.get("refine_h4_channels", 64),
+            h2_skip_channels=checkpoint_config.get("h2_skip_channels", 16),
+            refine_h2_channels=checkpoint_config.get("refine_h2_channels", 32),
+            fine_output_channels=checkpoint_config.get("fine_output_channels", 24),
+            fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
         ).to(device)
     else:
         model = FastSCNN(num_classes=num_classes, aux=True).to(device)

@@ -674,6 +674,61 @@ python models/fast_scnn_salient.py --device cuda --full-res
 python models/fast_scnn_salient.py --device cpu --iterations 5
 ```
 
+### Upgraded Multiscale Fine Head & Gating
+
+The model has been upgraded with a multiscale refinement head and a bidirectional gating mechanism.
+
+#### Multiscale Refinement Head (`--refinement-head multiscale`)
+
+Instead of refinement at `H/8` only, the multiscale head progressively fuses high-resolution skip features from the backbone:
+- **H/8 refinement block**: processes the attended shared features concatenated with the coarse prompt.
+- **H/4 Skip Fusion**: upsamples the H/8 output, projects `feature_h4` from the backbone, concatenates them, and refines them.
+- **H/2 Skip Fusion**: upsamples the H/4 output, projects `feature_h2` from the backbone, concatenates them, and refines them.
+- **Full Resolution Output Block**: upsamples the H/2 output, processes it, and generates the final full-resolution `fine_logits`.
+
+#### Bidirectional Spatial Prompt Gating (`--prompt-gate-mode bidirectional`)
+
+We introduce bidirectional prompt gating to suppress background false positives and focus attention on boundary regions:
+```
+F_attended = F_shared × (1 + strength × P) + F_shared × (strength × P_boundary)
+```
+Where:
+- `P` is the coarse probability prompt.
+- `P_boundary` is the coarse prompt boundary weight map, computed as `|P_dilated - P_eroded|` using morphological dilation and erosion.
+- Gate strength is configurable via `--prompt-gate-strength` (default: `0.5`).
+
+#### Precision-Oriented Loss Profile (`--loss-profile precision_salient`)
+
+Designed to penalize false positives directly and focus learning on complex edge details:
+- **Binary Tversky Loss**: Batch-wise Tversky index with asymmetric weights. Configurable via `--tversky-fp-weight` (default `0.7` to penalize false positives) and `--tversky-fn-weight` (default `0.3`).
+- **Boundary Weighted BCE Loss**: Computes BCE with custom pixel weights (`1.0 + 4.0 * boundary_band`), where the boundary band is mined using morphological max/min pooling on the GT mask. Configurable via `--boundary-kernel-size` (default `7`) and `--boundary-extra-weight` (default `4.0`).
+- **Hard Negative BCE Loss**: Evaluates BCE on the background pixels and backpropagates only the top-k worst background pixels (online hard negative mining). Configurable via `--hard-negative-ratio` (default `0.10`) and `--hard-negative-min-pixels` (default `256`).
+
+#### Validation & Test Threshold Sweep (`--threshold-sweep`)
+
+During validation and evaluation, the `--threshold-sweep` parameter enables automated sweep over threshold candidates `[0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]`:
+- Reports Precision, Recall, IoU, Dice, and False Positive Rate for each candidate.
+- Automatically selects the threshold with the **best Dice** score.
+- Saves `best_validation_threshold` in the checkpoint for downstream inference and ONNX export.
+
+Example training command:
+```bash
+python train.py \
+  --model fast_scnn_salient \
+  --data-root duts_data \
+  --allow-threshold \
+  --refinement-head multiscale \
+  --prompt-gate-mode bidirectional \
+  --prompt-gate-strength 0.5 \
+  --loss-profile precision_salient \
+  --tversky-fp-weight 0.7 \
+  --tversky-fn-weight 0.3 \
+  --boundary-kernel-size 7 \
+  --boundary-extra-weight 4.0 \
+  --hard-negative-ratio 0.10 \
+  --threshold-sweep
+```
+
 ---
 
 ## Trimap Generation Tool
