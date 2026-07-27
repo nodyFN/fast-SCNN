@@ -189,7 +189,7 @@ def train_one_epoch(
                 with torch.no_grad():
                     teacher_out = teacher(images)
                 
-                is_sal = (cfg.model == "fast_scnn_salient")
+                is_sal = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
                 kd_loss = compute_kd_loss(
                     student_out=output,
                     teacher_out=teacher_out,
@@ -593,6 +593,14 @@ def run_smoke_test(cfg: Config) -> None:
             fine_output_channels=cfg.fine_output_channels,
             fine_dropout=cfg.fine_dropout,
         ).to(device)
+    elif cfg.model == "unet":
+        is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
+        unet_out_ch = 1 if is_salient_task else cfg.num_classes
+        unet_model = UNet(in_channels=3, out_channels=unet_out_ch).to(device)
+        if is_salient_task:
+            model = UNetSalientAdapter(unet_model)
+        else:
+            model = unet_model
     else:
         model = FastSCNN(num_classes=cfg.num_classes, aux=cfg.aux, dropout_p=cfg.dropout_p).to(device)
     optimizer = build_optimizer(model, cfg)
@@ -635,7 +643,7 @@ def run_smoke_test(cfg: Config) -> None:
     teacher = None
     if getattr(cfg, "teacher_weights", None):
         logger.info(f"  Smoke test: loading teacher from {cfg.teacher_weights}...")
-        teacher_out_ch = 1 if cfg.model == "fast_scnn_salient" else cfg.num_classes
+        teacher_out_ch = 1 if (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", ""))) else cfg.num_classes
         teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
         load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
         teacher.eval()
@@ -912,7 +920,7 @@ def train(cfg: Config) -> None:
     teacher = None
     if getattr(cfg, "teacher_weights", None):
         logger.info(f"Setting up UNet Teacher Model from {cfg.teacher_weights}...")
-        teacher_out_ch = 1 if cfg.model == "fast_scnn_salient" else cfg.num_classes
+        teacher_out_ch = 1 if (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", ""))) else cfg.num_classes
         teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
         load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
         teacher.eval()
@@ -1002,7 +1010,7 @@ def train(cfg: Config) -> None:
         )
     else:
         metrics_obj = SegmentationMetrics(
-            2 if cfg.model == "fast_scnn_salient" else cfg.num_classes,
+            2 if (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", ""))) else cfg.num_classes,
             cfg.ignore_index
         )
 
@@ -1096,7 +1104,7 @@ def train(cfg: Config) -> None:
                     f"MSE={val_results['mse']:.6f} GradErr={val_results['gradient_error']:.4f} "
                     f"SAD-T={val_results['sad_t']:.1f} MSE-T={val_results['mse_t']:.6f}"
                 )
-            elif cfg.model == "fast_scnn_salient":
+            elif cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
                 loss_str = " ".join([f"{k}={v:.4f}" for k, v in train_losses.items() if k != "total"])
                 logger.info(
                     f"Epoch {epoch}/{cfg.epochs - 1} ({elapsed:.1f}s) | "
@@ -1204,7 +1212,7 @@ def train(cfg: Config) -> None:
                                 threshold=cfg.foreground_threshold,
                             )
                         else:
-                            if cfg.model == "fast_scnn_salient":
+                            if cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
                                 preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
                                 probs = preds_outputs["fine_prob"].squeeze(1)
                             else:
