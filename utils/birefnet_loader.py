@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
     """Load pre-trained BiRefNet model from local weights path, isolated from local imports and CWD issues."""
+    weights_path = str(Path(weights_path).resolve())
     birefnet_path = str(PROJECT_ROOT / "BiRefNet")
     models_dir = str(PROJECT_ROOT / "BiRefNet" / "models")
     
