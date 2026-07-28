@@ -64,12 +64,15 @@ class SegmentationDataset(Dataset):
         root: Path | str,
         transform: Optional[Callable] = None,
         allow_threshold: bool = False,
+        mask_subdir: str = "masks",
+        load_as_alpha: bool = False,
     ) -> None:
         self.root = Path(root)
         self.image_dir = self.root / "images"
-        self.mask_dir = self.root / "masks"
+        self.mask_dir = self.root / mask_subdir
         self.transform = transform
         self.allow_threshold = allow_threshold
+        self.load_as_alpha = load_as_alpha
 
         # Validate directories
         if not self.root.exists():
@@ -135,7 +138,10 @@ class SegmentationDataset(Dataset):
             )
 
         # Convert mask values
-        mask = self._convert_mask(mask, mask_path)
+        if self.load_as_alpha:
+            mask = mask.astype(np.float32) / 255.0
+        else:
+            mask = self._convert_mask(mask, mask_path)
 
         # Apply augmentations
         if self.transform is not None:
@@ -146,7 +152,10 @@ class SegmentationDataset(Dataset):
         # Ensure correct dtypes
         if isinstance(mask, np.ndarray):
             mask = torch.from_numpy(mask)
-        mask = mask.long()
+        if self.load_as_alpha:
+            mask = mask.float()
+        else:
+            mask = mask.long()
 
         return {"image": image, "mask": mask}
 

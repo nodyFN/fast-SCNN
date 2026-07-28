@@ -227,6 +227,10 @@ class Config:
     kd_alpha: float = 0.5
     kd_temperature: float = 1.0
     kd_loss_type: str = "mse"  # "mse" | "l1" | "kl"
+    kd_mode: str = "online"  # "online" | "offline"
+    kd_teacher_type: str = "unet"  # "unet" | "birefnet"
+    mask_subdir: str = "masks"
+    load_as_alpha: bool = False
 
     # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None

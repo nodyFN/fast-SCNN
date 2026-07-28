@@ -57,6 +57,7 @@ from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
 from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss
 from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
+from utils.birefnet_loader import load_birefnet_teacher
 from utils.scheduler import build_scheduler
 from utils.seed import seed_everything
 from utils.visualization import save_all_curves, visualize_segmentation, visualize_matting
@@ -188,6 +189,8 @@ def train_one_epoch(
             if teacher is not None:
                 with torch.no_grad():
                     teacher_out = teacher(images)
+                    if isinstance(teacher_out, (list, tuple)):
+                        teacher_out = teacher_out[-1]
                 
                 is_sal = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
                 kd_loss = compute_kd_loss(
@@ -680,6 +683,8 @@ def run_smoke_test(cfg: Config) -> None:
                 if teacher is not None:
                     with torch.no_grad():
                         teacher_out = teacher(images)
+                        if isinstance(teacher_out, (list, tuple)):
+                            teacher_out = teacher_out[-1]
                     is_sal = is_salient_mode
                     kd_loss = compute_kd_loss(
                         student_out=output,
@@ -825,8 +830,21 @@ def train(cfg: Config) -> None:
             longest_max_size=getattr(cfg, "longest_max_size", None),
         )
         val_transform = build_val_transform(cfg.val_height, cfg.val_width)
-        train_ds = SegmentationDataset(cfg.train_dir, transform=train_transform, allow_threshold=cfg.allow_threshold)
-        val_ds = SegmentationDataset(cfg.val_dir, transform=val_transform, allow_threshold=cfg.allow_threshold)
+        load_as_alpha = cfg.load_as_alpha or (getattr(cfg, "kd_mode", "online") == "offline")
+        train_ds = SegmentationDataset(
+            cfg.train_dir,
+            transform=train_transform,
+            allow_threshold=cfg.allow_threshold,
+            mask_subdir=getattr(cfg, "mask_subdir", "masks"),
+            load_as_alpha=load_as_alpha,
+        )
+        val_ds = SegmentationDataset(
+            cfg.val_dir,
+            transform=val_transform,
+            allow_threshold=cfg.allow_threshold,
+            mask_subdir=getattr(cfg, "mask_subdir", "masks"),
+            load_as_alpha=load_as_alpha,
+        )
     logger.info(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     if is_ddp:
@@ -918,14 +936,19 @@ def train(cfg: Config) -> None:
 
     # Load Teacher Model for Knowledge Distillation if requested
     teacher = None
-    if getattr(cfg, "teacher_weights", None):
-        logger.info(f"Setting up UNet Teacher Model from {cfg.teacher_weights}...")
-        teacher_out_ch = 1 if (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", ""))) else cfg.num_classes
-        teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
-        load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
-        teacher.eval()
-        for param in teacher.parameters():
-            param.requires_grad = False
+    if getattr(cfg, "teacher_weights", None) and getattr(cfg, "kd_mode", "online") == "online":
+        teacher_type = getattr(cfg, "kd_teacher_type", "unet")
+        if teacher_type == "birefnet":
+            logger.info(f"Setting up BiRefNet Teacher Model from {cfg.teacher_weights}...")
+            teacher = load_birefnet_teacher(cfg.teacher_weights, device)
+        else:
+            logger.info(f"Setting up UNet Teacher Model from {cfg.teacher_weights}...")
+            teacher_out_ch = 1 if (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", ""))) else cfg.num_classes
+            teacher = UNet(in_channels=3, out_channels=teacher_out_ch).to(device)
+            load_checkpoint(cfg.teacher_weights, teacher, map_location=device, weights_only=True)
+            teacher.eval()
+            for param in teacher.parameters():
+                param.requires_grad = False
 
 
     total_p, trainable_p = count_parameters(model)
@@ -1381,6 +1404,14 @@ def parse_args() -> argparse.Namespace:
                    help="Scaling temperature for distillation logits/probabilities")
     p.add_argument("--kd-loss-type", choices=["mse", "l1", "kl"], default=None,
                    help="Loss type for distillation")
+    p.add_argument("--kd-mode", choices=["online", "offline"], default=None,
+                   help="KD training mode: online (on-the-fly teacher) or offline (pre-generated matts)")
+    p.add_argument("--kd-teacher-type", choices=["unet", "birefnet"], default=None,
+                   help="Teacher model architecture")
+    p.add_argument("--mask-subdir", type=str, default=None,
+                   help="Subdirectory under dataset root containing ground truth masks/alphas")
+    p.add_argument("--load-as-alpha", action="store_true", default=None,
+                   help="If true, load ground truth as continuous float alpha map [0,1]")
     return p.parse_args()
 
 
@@ -1525,6 +1556,14 @@ def main() -> None:
         cfg.kd_temperature = args.kd_temperature
     if args.kd_loss_type is not None:
         cfg.kd_loss_type = args.kd_loss_type
+    if args.kd_mode is not None:
+        cfg.kd_mode = args.kd_mode
+    if args.kd_teacher_type is not None:
+        cfg.kd_teacher_type = args.kd_teacher_type
+    if args.mask_subdir is not None:
+        cfg.mask_subdir = args.mask_subdir
+    if args.load_as_alpha is not None:
+        cfg.load_as_alpha = args.load_as_alpha
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

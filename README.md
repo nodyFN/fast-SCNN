@@ -770,6 +770,43 @@ python train.py \
 ```
 This will produce a standard UNet checkpoint which you can subsequently use as the teacher model (`--teacher-weights`).
 
+#### BiRefNet Knowledge Distillation (Online & Offline)
+
+You can use the high-quality **BiRefNet** model to guide student model training via either **Online** (dynamic forward pass on the GPU) or **Offline** (using pre-generated alpha matts on disk) Knowledge Distillation.
+
+The pre-trained BiRefNet model weights should be located at `BiRefNet/model_weight/BiRefNet_dynamic-general-epoch_174.pth`.
+
+##### 1. Online Knowledge Distillation
+In this mode, images are dynamically forwarded through the frozen BiRefNet model on the GPU during training:
+
+```bash
+python train.py \
+  --model fast_scnn_salient \
+  --data-root duts_data \
+  --allow-threshold \
+  --kd-mode online \
+  --kd-teacher-type birefnet \
+  --teacher-weights BiRefNet/model_weight/BiRefNet_dynamic-general-epoch_174.pth \
+  --kd-alpha 0.5 \
+  --kd-temperature 1.5 \
+  --kd-loss-type mse
+```
+
+##### 2. Offline Knowledge Distillation
+In this mode, the training dataset loads pre-generated alpha matts from a custom subdirectory as continuous `[0.0, 1.0]` float target labels directly (no teacher model is loaded on the GPU):
+
+```bash
+python train.py \
+  --model fast_scnn_salient \
+  --data-root duts_data \
+  --kd-mode offline \
+  --mask-subdir alpha_masks \
+  --epochs 200 \
+  --batch-size 8 \
+  --lr 0.002
+```
+*Note: Make sure your pre-generated alpha masks are placed in `duts_data/train/alpha_masks` and `duts_data/val/alpha_masks` respectively.*
+
 ---
 
 ## Trimap Generation Tool
