@@ -8,18 +8,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
     """Load pre-trained BiRefNet model from local weights path, isolated from local imports."""
     birefnet_path = str(PROJECT_ROOT / "BiRefNet")
+    models_dir = str(PROJECT_ROOT / "BiRefNet" / "models")
     
-    # Identify modules to temporarily pop to avoid package resolution/caching collisions
-    pop_prefixes = ('models', 'config', 'dataset')
+    # 1. Pop config and dataset from sys.modules to resolve them from BiRefNet/
+    pop_prefixes = ('config', 'dataset')
     original_modules = {}
     for k in list(sys.modules.keys()):
         if k in pop_prefixes or k.startswith(tuple(p + '.' for p in pop_prefixes)):
             original_modules[k] = sys.modules.pop(k)
             
+    # 2. Add BiRefNet to sys.path
     original_path = list(sys.path)
+    
     try:
         if birefnet_path not in sys.path:
             sys.path.insert(0, birefnet_path)
+        
+        # 3. Add BiRefNet/models to models.__path__
+        import models
+        if hasattr(models, "__path__"):
+            models_paths = list(models.__path__)
+            models.__path__ = [models_dir] + models_paths
             
         from models.birefnet import BiRefNet
         from utils import check_state_dict
@@ -47,9 +56,14 @@ def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
         return model
         
     finally:
-        # Restore original sys.path
+        # Restore sys.path
         sys.path = original_path
         
+        # Restore models.__path__
+        import models
+        if hasattr(models, "__path__"):
+            models.__path__ = [p for p in models.__path__ if p != models_dir]
+            
         # Pop the newly loaded BiRefNet specific modules so they do not pollute the main namespace
         for k in list(sys.modules.keys()):
             if k in pop_prefixes or k.startswith(tuple(p + '.' for p in pop_prefixes)):
