@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import torch
@@ -6,7 +7,7 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
-    """Load pre-trained BiRefNet model from local weights path, isolated from local imports."""
+    """Load pre-trained BiRefNet model from local weights path, isolated from local imports and CWD issues."""
     birefnet_path = str(PROJECT_ROOT / "BiRefNet")
     models_dir = str(PROJECT_ROOT / "BiRefNet" / "models")
     
@@ -19,10 +20,14 @@ def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
             
     # 2. Add BiRefNet to sys.path
     original_path = list(sys.path)
+    original_cwd = os.getcwd()
     
     try:
         if birefnet_path not in sys.path:
             sys.path.insert(0, birefnet_path)
+            
+        # Change current working directory to BiRefNet/ so that config.py parses its own train.sh correctly
+        os.chdir(birefnet_path)
         
         # 3. Add BiRefNet/models to models.__path__
         import models
@@ -56,6 +61,9 @@ def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
         return model
         
     finally:
+        # Restore CWD
+        os.chdir(original_cwd)
+        
         # Restore sys.path
         sys.path = original_path
         
