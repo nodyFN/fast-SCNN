@@ -10,8 +10,8 @@ def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
     birefnet_path = str(PROJECT_ROOT / "BiRefNet")
     models_dir = str(PROJECT_ROOT / "BiRefNet" / "models")
     
-    # 1. Pop config and dataset from sys.modules to resolve them from BiRefNet/
-    pop_prefixes = ('config', 'dataset')
+    # 1. Pop config, dataset and utils from sys.modules to resolve them from BiRefNet/
+    pop_prefixes = ('config', 'dataset', 'utils')
     original_modules = {}
     for k in list(sys.modules.keys()):
         if k in pop_prefixes or k.startswith(tuple(p + '.' for p in pop_prefixes)):
