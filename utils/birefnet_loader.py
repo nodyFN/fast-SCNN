@@ -6,13 +6,18 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
-    """Load pre-trained BiRefNet model from local weights path."""
+    """Load pre-trained BiRefNet model from local weights path, isolated from local imports."""
     birefnet_path = str(PROJECT_ROOT / "BiRefNet")
     
-    # Save original sys.path
+    # Identify modules to temporarily pop to avoid package resolution/caching collisions
+    pop_prefixes = ('models', 'config', 'dataset')
+    original_modules = {}
+    for k in list(sys.modules.keys()):
+        if k in pop_prefixes or k.startswith(tuple(p + '.' for p in pop_prefixes)):
+            original_modules[k] = sys.modules.pop(k)
+            
     original_path = list(sys.path)
     try:
-        # Prepend BiRefNet path to avoid namespace conflicts
         if birefnet_path not in sys.path:
             sys.path.insert(0, birefnet_path)
             
@@ -44,3 +49,11 @@ def load_birefnet_teacher(weights_path: str, device: torch.device) -> nn.Module:
     finally:
         # Restore original sys.path
         sys.path = original_path
+        
+        # Pop the newly loaded BiRefNet specific modules so they do not pollute the main namespace
+        for k in list(sys.modules.keys()):
+            if k in pop_prefixes or k.startswith(tuple(p + '.' for p in pop_prefixes)):
+                sys.modules.pop(k, None)
+                
+        # Restore the original modules back to sys.modules
+        sys.modules.update(original_modules)
