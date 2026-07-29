@@ -593,8 +593,9 @@ def run_smoke_test(cfg: Config) -> None:
             refine_h4_channels=cfg.refine_h4_channels,
             h2_skip_channels=cfg.h2_skip_channels,
             refine_h2_channels=cfg.refine_h2_channels,
-            fine_output_channels=cfg.fine_output_channels,
             fine_dropout=cfg.fine_dropout,
+            prompt_detach=getattr(cfg, "prompt_detach", True),
+            uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
@@ -885,8 +886,9 @@ def train(cfg: Config) -> None:
             refine_h4_channels=cfg.refine_h4_channels,
             h2_skip_channels=cfg.h2_skip_channels,
             refine_h2_channels=cfg.refine_h2_channels,
-            fine_output_channels=cfg.fine_output_channels,
             fine_dropout=cfg.fine_dropout,
+            prompt_detach=getattr(cfg, "prompt_detach", True),
+            uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
@@ -1238,11 +1240,14 @@ def train(cfg: Config) -> None:
                             if cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
                                 preds = (preds_outputs["fine_logits"] > 0.0).squeeze(1).long()
                                 probs = preds_outputs["fine_prob"].squeeze(1)
+                                alpha_maps = probs
                             else:
                                 preds = preds_outputs.argmax(dim=1)
                                 probs = torch.softmax(preds_outputs, dim=1)[:, 1]
+                                alpha_maps = None
                             visualize_segmentation(
                                 imgs, msks, preds, probs,
+                                alpha_maps=alpha_maps,
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                             )
@@ -1412,6 +1417,12 @@ def parse_args() -> argparse.Namespace:
                    help="Subdirectory under dataset root containing ground truth masks/alphas")
     p.add_argument("--load-as-alpha", action="store_true", default=None,
                    help="If true, load ground truth as continuous float alpha map [0,1]")
+    p.add_argument("--prompt-detach", action="store_true", dest="prompt_detach", default=None,
+                   help="Detach coarse logits when building guidance maps")
+    p.add_argument("--no-prompt-detach", action="store_false", dest="prompt_detach", default=None,
+                   help="Do not detach coarse logits when building guidance maps")
+    p.add_argument("--uncertainty-floor", type=float, default=None,
+                   help="Minimum value (floor) for the detail gate")
     return p.parse_args()
 
 
@@ -1564,6 +1575,10 @@ def main() -> None:
         cfg.mask_subdir = args.mask_subdir
     if args.load_as_alpha is not None:
         cfg.load_as_alpha = args.load_as_alpha
+    if args.prompt_detach is not None:
+        cfg.prompt_detach = args.prompt_detach
+    if args.uncertainty_floor is not None:
+        cfg.uncertainty_floor = args.uncertainty_floor
 
     # Generate timestamp and redirect config directories
     from datetime import datetime

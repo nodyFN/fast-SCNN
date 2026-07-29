@@ -124,6 +124,8 @@ def evaluate(
             refine_h2_channels=checkpoint_config.get("refine_h2_channels", 32),
             fine_output_channels=checkpoint_config.get("fine_output_channels", 24),
             fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
+            prompt_detach=checkpoint_config.get("prompt_detach", True),
+            uncertainty_floor=checkpoint_config.get("uncertainty_floor", 0.15),
         ).to(device)
     else:
         model = FastSCNN(num_classes=cfg.num_classes, aux=True).to(device)

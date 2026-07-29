@@ -135,6 +135,7 @@ def visualize_segmentation(
     save_path: Optional[Path | str] = None,
     num_samples: int = 4,
     class_colors: Optional[Dict[int, tuple]] = None,
+    alpha_maps: Optional[torch.Tensor] = None,
 ) -> None:
     """Visualize segmentation results.
 
@@ -146,19 +147,29 @@ def visualize_segmentation(
     probs_fg : [B, H, W] float, optional foreground probability map
     save_path : where to save the figure
     num_samples : max number of samples to plot
+    alpha_maps : [B, H, W] float, optional continuous alpha map
     """
     if class_colors is None:
         class_colors = {0: (0, 0, 0), 1: (0, 255, 0)}  # black BG, green FG
 
     n = min(num_samples, images.shape[0])
-    ncols = 5 if probs_fg is not None else 4
+    
+    ncols = 4
+    if probs_fg is not None:
+        ncols += 1
+    if alpha_maps is not None:
+        ncols += 1
+        
     fig, axes = plt.subplots(n, ncols, figsize=(ncols * 4, n * 3.5))
     if n == 1:
         axes = axes[np.newaxis, :]
 
-    col_titles = ["Image", "Ground Truth", "Prediction", "Overlay"]
+    col_titles = ["Image", "Ground Truth", "Prediction"]
     if probs_fg is not None:
-        col_titles.insert(3, "FG Probability")
+        col_titles.append("FG Probability")
+    if alpha_maps is not None:
+        col_titles.append("Alpha Map")
+    col_titles.append("Overlay")
 
     for row in range(n):
         # Denormalize image
@@ -192,6 +203,13 @@ def visualize_segmentation(
         if probs_fg is not None:
             prob = probs_fg[row].cpu().numpy()
             axes[row, col].imshow(prob, cmap="hot", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if alpha_maps is not None:
+            alpha = alpha_maps[row].cpu().numpy()
+            axes[row, col].imshow(alpha, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
             col += 1

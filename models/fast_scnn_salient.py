@@ -220,9 +220,9 @@ class LegacyRefinementHead(nn.Module):
         super().__init__()
         self.prompt_gate_mode = prompt_gate_mode
         self.prompt_gate_strength = prompt_gate_strength
-        # 1×1 projection: (C + 1) → refinement_channels
+        # 1×1 projection: (C + 3) → refinement_channels
         self.proj = ConvBNReLU(
-            in_channels + 1, refinement_channels,
+            in_channels + 3, refinement_channels,
             kernel_size=1, stride=1, padding=0,
         )
         # 3×3 DSConv: refinement_channels → refinement_channels
@@ -236,17 +236,19 @@ class LegacyRefinementHead(nn.Module):
     def forward(
         self,
         shared_feature: torch.Tensor,
-        coarse_prompt: torch.Tensor,
+        alpha_prompt_h8: torch.Tensor,
+        uncertainty_h8: torch.Tensor,
+        boundary_h8: torch.Tensor,
     ) -> torch.Tensor:
         # Spatial Gating
         if self.prompt_gate_mode == "bidirectional":
-            gate = 1.0 + self.prompt_gate_strength * (2.0 * coarse_prompt - 1.0)
+            gate = 1.0 + self.prompt_gate_strength * (2.0 * alpha_prompt_h8 - 1.0)
             f_attended = shared_feature * gate
         else:
-            f_attended = shared_feature + shared_feature * coarse_prompt
+            f_attended = shared_feature + shared_feature * alpha_prompt_h8
 
-        # Channel concatenation: [B, C, H, W] + [B, 1, H, W] → [B, C+1, H, W]
-        refinement_input = torch.cat([f_attended, coarse_prompt], dim=1)
+        # Channel concatenation: [B, C, H, W] + [B, 3, H, W] → [B, C+3, H, W]
+        refinement_input = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
 
         # Convolution stack
         x = self.proj(refinement_input)
@@ -280,9 +282,9 @@ class MultiscaleRefinementHead(nn.Module):
         self.prompt_gate_mode = prompt_gate_mode
         self.prompt_gate_strength = prompt_gate_strength
 
-        # H/8 Block: Concat(F_attended, coarse_prompt) -> (in_channels + 1) to refine_h8_channels
+        # H/8 Block: Concat(F_attended, alpha_prompt, uncertainty, boundary) -> (in_channels + 3) to refine_h8_channels
         self.h8_proj = ConvBNReLU(
-            in_channels + 1, refine_h8_channels,
+            in_channels + 3, refine_h8_channels,
             kernel_size=1, stride=1, padding=0,
         )
         self.h8_dsconv = DepthwiseSeparableConv(
@@ -328,18 +330,20 @@ class MultiscaleRefinementHead(nn.Module):
         feature_h8: torch.Tensor,
         feature_h4: torch.Tensor,
         feature_h2: torch.Tensor,
-        coarse_prompt: torch.Tensor,
+        alpha_prompt_h8: torch.Tensor,
+        uncertainty_h8: torch.Tensor,
+        boundary_h8: torch.Tensor,
         input_size: Tuple[int, int],
     ) -> torch.Tensor:
         # Spatial Attention Gating on feature_h8
         if self.prompt_gate_mode == "bidirectional":
-            gate = 1.0 + self.prompt_gate_strength * (2.0 * coarse_prompt - 1.0)
+            gate = 1.0 + self.prompt_gate_strength * (2.0 * alpha_prompt_h8 - 1.0)
             f_attended = feature_h8 * gate
         else:
-            f_attended = feature_h8 + feature_h8 * coarse_prompt
+            f_attended = feature_h8 + feature_h8 * alpha_prompt_h8
 
         # H/8 Block
-        x = torch.cat([f_attended, coarse_prompt], dim=1)
+        x = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
         x = self.h8_proj(x)
         x = self.h8_dsconv(x)
 
@@ -432,8 +436,12 @@ class FastSCNNSalient(nn.Module):
         refine_h2_channels: int = 32,
         fine_output_channels: int = 24,
         fine_dropout: float = 0.1,
+        prompt_detach: bool = True,
+        uncertainty_floor: float = 0.15,
     ) -> None:
         super().__init__()
+        self.prompt_detach = prompt_detach
+        self.uncertainty_floor = uncertainty_floor
         self.backbone = SharedFastSCNNBackbone(
             ppm_pool_sizes=ppm_pool_sizes,
         )
@@ -483,49 +491,48 @@ class FastSCNNSalient(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
+    @staticmethod
+    def build_guidance(
+        logits: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build alpha prompt, uncertainty, and boundary maps from logits."""
+        alpha_prompt = torch.sigmoid(logits)
+        uncertainty = 4.0 * alpha_prompt * (1.0 - alpha_prompt)
+        p_max = F.max_pool2d(
+            alpha_prompt,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+        p_min = -F.max_pool2d(
+            -alpha_prompt,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+        boundary = p_max - p_min
+        return alpha_prompt, uncertainty, boundary
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         input_size = x.shape[-2:]  # (H, W)
 
-        if self.refinement_head_type == "multiscale":
-            # ── Shared Backbone (executed ONCE) ───────────────────────────
-            feats = self.backbone.forward_features(x)
-            shared_feature = feats["feature_h8"]
-            feature_h4 = feats["feature_h4"]
-            feature_h2 = feats["feature_h2"]
-        else:
-            shared_feature = self.backbone(x)
-            feature_h4 = None
-            feature_h2 = None
-
-        # ── Coarse Head ───────────────────────────────────────────────
-        coarse_logits_lowres = self.coarse_head(shared_feature)
-        # [B, 1, H/8, W/8]
-
-        # Coarse probability at low resolution
-        coarse_prob_lowres = torch.sigmoid(coarse_logits_lowres)
-
-        # Stop-gradient: only detach the probability prompt
-        # Fine Loss updates Refinement Head + Backbone, but NOT Coarse Head
-        coarse_prompt = coarse_prob_lowres.detach()  # requires_grad=False
-
-        # ── Refinement Head ───────────────────────────────────────────
-        if self.refinement_head_type == "multiscale":
-            fine_logits = self.refinement_head(
-                shared_feature, feature_h4, feature_h2, coarse_prompt, input_size
-            )
-        else:
-            fine_logits_lowres = self.refinement_head(
-                shared_feature, coarse_prompt,
-            )  # [B, 1, H/8, W/8]
-            # ── Upsample legacy fine logits to full resolution ──────────
-            fine_logits = F.interpolate(
-                fine_logits_lowres,
-                size=input_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        # ── Upsample coarse logits to full resolution ──────────────────
+        # ── Stage 0: 1/2 resolution global prediction ────────────────
+        coarse_image = F.interpolate(
+            x,
+            scale_factor=0.5,
+            mode="bilinear",
+            align_corners=False,
+            recompute_scale_factor=False,
+        )
+        
+        # Run 0.5x resolution image through shared backbone
+        coarse_feats = self.backbone.forward_features(coarse_image)
+        coarse_shared_feature = coarse_feats["feature_h8"]
+        
+        coarse_logits_lowres = self.coarse_head(coarse_shared_feature)
+        # [B, 1, H/16, W/16]
+        
+        # Upsample coarse logits back to full resolution
         coarse_logits = F.interpolate(
             coarse_logits_lowres,
             size=input_size,
@@ -533,15 +540,64 @@ class FastSCNNSalient(nn.Module):
             align_corners=False,
         )
         coarse_prob = torch.sigmoid(coarse_logits)
+
+        # ── Build three guidance maps ────────────────────────────────
+        previous_logits = coarse_logits.detach() if self.prompt_detach else coarse_logits
+        alpha_prompt, uncertainty, boundary = self.build_guidance(previous_logits)
+
+        # ── Stage 1: full-resolution refinement ──────────────────────
+        full_feats = self.backbone.forward_features(x)
+        feature_h8 = full_feats["feature_h8"]
+        feature_h4 = full_feats["feature_h4"]
+        feature_h2 = full_feats["feature_h2"]
+        
+        # Resize guidance maps to the target feature resolutions
+        h8_size = feature_h8.shape[-2:]
+        alpha_prompt_h8 = F.interpolate(alpha_prompt, size=h8_size, mode="bilinear", align_corners=False)
+        uncertainty_h8 = F.interpolate(uncertainty, size=h8_size, mode="bilinear", align_corners=False)
+        boundary_h8 = F.interpolate(boundary, size=h8_size, mode="bilinear", align_corners=False)
+
+        if self.refinement_head_type == "multiscale":
+            residual_logits = self.refinement_head(
+                feature_h8, feature_h4, feature_h2,
+                alpha_prompt_h8, uncertainty_h8, boundary_h8,
+                input_size
+            )
+        else:
+            residual_logits = self.refinement_head(
+                feature_h8,
+                alpha_prompt_h8, uncertainty_h8, boundary_h8
+            )
+            # Upsample legacy fine logits to full resolution
+            residual_logits = F.interpolate(
+                residual_logits,
+                size=input_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        # ── Soft Detail Gate ──────────────────────────────────────────
+        detail_gate = torch.maximum(uncertainty, boundary)
+        detail_gate = self.uncertainty_floor + (1.0 - self.uncertainty_floor) * detail_gate
+        
+        # Final logits & probability
+        fine_logits = coarse_logits + detail_gate * residual_logits
         fine_prob = torch.sigmoid(fine_logits)
 
+        # Keep legacy keys for backward compatibility (e.g. coarse_prompt, coarse_logits_lowres)
         return {
             "coarse_logits": coarse_logits,
             "coarse_prob": coarse_prob,
             "fine_logits": fine_logits,
             "fine_prob": fine_prob,
             "coarse_logits_lowres": coarse_logits_lowres,
-            "coarse_prompt": coarse_prompt,
+            "coarse_prompt": alpha_prompt_h8,
+            # RMFormer specific outputs
+            "residual_logits": residual_logits,
+            "alpha_prompt": alpha_prompt,
+            "uncertainty": uncertainty,
+            "boundary": boundary,
+            "detail_gate": detail_gate,
         }
 
 

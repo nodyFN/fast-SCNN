@@ -231,6 +231,8 @@ class Config:
     kd_teacher_type: str = "unet"  # "unet" | "birefnet"
     mask_subdir: str = "masks"
     load_as_alpha: bool = False
+    prompt_detach: bool = True
+    uncertainty_floor: float = 0.15
 
     # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None
