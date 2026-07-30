@@ -233,6 +233,7 @@ class Config:
     load_as_alpha: bool = False
     prompt_detach: bool = True
     uncertainty_floor: float = 0.15
+    resolution_hierarchy: bool = True
 
     # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None

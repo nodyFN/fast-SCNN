@@ -216,13 +216,16 @@ class LegacyRefinementHead(nn.Module):
         dropout_p: float = 0.1,
         prompt_gate_mode: str = "legacy_additive",
         prompt_gate_strength: float = 0.5,
+        resolution_hierarchy: bool = True,
     ) -> None:
         super().__init__()
         self.prompt_gate_mode = prompt_gate_mode
         self.prompt_gate_strength = prompt_gate_strength
-        # 1×1 projection: (C + 3) → refinement_channels
+        self.resolution_hierarchy = resolution_hierarchy
+        extra_channels = 3 if resolution_hierarchy else 1
+        # 1×1 projection: (C + extra_channels) → refinement_channels
         self.proj = ConvBNReLU(
-            in_channels + 3, refinement_channels,
+            in_channels + extra_channels, refinement_channels,
             kernel_size=1, stride=1, padding=0,
         )
         # 3×3 DSConv: refinement_channels → refinement_channels
@@ -237,8 +240,8 @@ class LegacyRefinementHead(nn.Module):
         self,
         shared_feature: torch.Tensor,
         alpha_prompt_h8: torch.Tensor,
-        uncertainty_h8: torch.Tensor,
-        boundary_h8: torch.Tensor,
+        uncertainty_h8: Optional[torch.Tensor] = None,
+        boundary_h8: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Spatial Gating
         if self.prompt_gate_mode == "bidirectional":
@@ -247,8 +250,11 @@ class LegacyRefinementHead(nn.Module):
         else:
             f_attended = shared_feature + shared_feature * alpha_prompt_h8
 
-        # Channel concatenation: [B, C, H, W] + [B, 3, H, W] → [B, C+3, H, W]
-        refinement_input = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
+        # Channel concatenation: [B, C, H, W] + [B, extra_channels, H, W]
+        if self.resolution_hierarchy:
+            refinement_input = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
+        else:
+            refinement_input = torch.cat([f_attended, alpha_prompt_h8], dim=1)
 
         # Convolution stack
         x = self.proj(refinement_input)
@@ -277,14 +283,17 @@ class MultiscaleRefinementHead(nn.Module):
         fine_dropout: float = 0.1,
         prompt_gate_mode: str = "bidirectional",
         prompt_gate_strength: float = 0.5,
+        resolution_hierarchy: bool = True,
     ) -> None:
         super().__init__()
         self.prompt_gate_mode = prompt_gate_mode
         self.prompt_gate_strength = prompt_gate_strength
+        self.resolution_hierarchy = resolution_hierarchy
 
-        # H/8 Block: Concat(F_attended, alpha_prompt, uncertainty, boundary) -> (in_channels + 3) to refine_h8_channels
+        extra_channels = 3 if resolution_hierarchy else 1
+        # H/8 Block: Concat(F_attended, alpha_prompt, uncertainty, boundary) -> (in_channels + extra_channels) to refine_h8_channels
         self.h8_proj = ConvBNReLU(
-            in_channels + 3, refine_h8_channels,
+            in_channels + extra_channels, refine_h8_channels,
             kernel_size=1, stride=1, padding=0,
         )
         self.h8_dsconv = DepthwiseSeparableConv(
@@ -331,9 +340,9 @@ class MultiscaleRefinementHead(nn.Module):
         feature_h4: torch.Tensor,
         feature_h2: torch.Tensor,
         alpha_prompt_h8: torch.Tensor,
-        uncertainty_h8: torch.Tensor,
-        boundary_h8: torch.Tensor,
-        input_size: Tuple[int, int],
+        uncertainty_h8: Optional[torch.Tensor] = None,
+        boundary_h8: Optional[torch.Tensor] = None,
+        input_size: Tuple[int, int] = (512, 1024),
     ) -> torch.Tensor:
         # Spatial Attention Gating on feature_h8
         if self.prompt_gate_mode == "bidirectional":
@@ -343,7 +352,10 @@ class MultiscaleRefinementHead(nn.Module):
             f_attended = feature_h8 + feature_h8 * alpha_prompt_h8
 
         # H/8 Block
-        x = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
+        if self.resolution_hierarchy:
+            x = torch.cat([f_attended, alpha_prompt_h8, uncertainty_h8, boundary_h8], dim=1)
+        else:
+            x = torch.cat([f_attended, alpha_prompt_h8], dim=1)
         x = self.h8_proj(x)
         x = self.h8_dsconv(x)
 
@@ -438,10 +450,13 @@ class FastSCNNSalient(nn.Module):
         fine_dropout: float = 0.1,
         prompt_detach: bool = True,
         uncertainty_floor: float = 0.15,
+        resolution_hierarchy: bool = True,
     ) -> None:
         super().__init__()
         self.prompt_detach = prompt_detach
         self.uncertainty_floor = uncertainty_floor
+        self.resolution_hierarchy = resolution_hierarchy
+        self.refinement_head_type = refinement_head
         self.backbone = SharedFastSCNNBackbone(
             ppm_pool_sizes=ppm_pool_sizes,
         )
@@ -450,7 +465,6 @@ class FastSCNNSalient(nn.Module):
             coarse_channels=coarse_channels,
             dropout_p=dropout_p,
         )
-        self.refinement_head_type = refinement_head
         if refinement_head == "legacy_h8":
             self.refinement_head = LegacyRefinementHead(
                 in_channels=128,
@@ -458,6 +472,7 @@ class FastSCNNSalient(nn.Module):
                 dropout_p=dropout_p,
                 prompt_gate_mode=prompt_gate_mode,
                 prompt_gate_strength=prompt_gate_strength,
+                resolution_hierarchy=resolution_hierarchy,
             )
         elif refinement_head == "multiscale":
             self.refinement_head = MultiscaleRefinementHead(
@@ -473,6 +488,7 @@ class FastSCNNSalient(nn.Module):
                 fine_dropout=fine_dropout,
                 prompt_gate_mode=prompt_gate_mode,
                 prompt_gate_strength=prompt_gate_strength,
+                resolution_hierarchy=resolution_hierarchy,
             )
         else:
             raise ValueError(f"Unknown refinement_head: {refinement_head}")
@@ -515,6 +531,58 @@ class FastSCNNSalient(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         input_size = x.shape[-2:]  # (H, W)
+
+        if not self.resolution_hierarchy:
+            # ── Original Single-Stage Forward ────────────────────────────
+            if self.refinement_head_type == "multiscale":
+                feats = self.backbone.forward_features(x)
+                shared_feature = feats["feature_h8"]
+                feature_h4 = feats["feature_h4"]
+                feature_h2 = feats["feature_h2"]
+            else:
+                shared_feature = self.backbone(x)
+                feature_h4 = None
+                feature_h2 = None
+
+            coarse_logits_lowres = self.coarse_head(shared_feature)
+            coarse_prob_lowres = torch.sigmoid(coarse_logits_lowres)
+            coarse_prompt = coarse_prob_lowres.detach()
+
+            h8_size = shared_feature.shape[-2:]
+
+            if self.refinement_head_type == "multiscale":
+                fine_logits = self.refinement_head(
+                    shared_feature, feature_h4, feature_h2,
+                    coarse_prompt, None, None, input_size
+                )
+            else:
+                fine_logits_lowres = self.refinement_head(
+                    shared_feature, coarse_prompt, None, None
+                )
+                fine_logits = F.interpolate(
+                    fine_logits_lowres,
+                    size=input_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            coarse_logits = F.interpolate(
+                coarse_logits_lowres,
+                size=input_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            coarse_prob = torch.sigmoid(coarse_logits)
+            fine_prob = torch.sigmoid(fine_logits)
+
+            return {
+                "coarse_logits": coarse_logits,
+                "coarse_prob": coarse_prob,
+                "fine_logits": fine_logits,
+                "fine_prob": fine_prob,
+                "coarse_logits_lowres": coarse_logits_lowres,
+                "coarse_prompt": coarse_prompt,
+            }
 
         # ── Stage 0: 1/2 resolution global prediction ────────────────
         coarse_image = F.interpolate(
