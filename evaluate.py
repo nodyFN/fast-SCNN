@@ -85,6 +85,20 @@ def evaluate(
         task_mode = checkpoint_config.get("task_mode", "segmentation")
     logger.info(f"Evaluation task mode: {task_mode}")
 
+    # Auto-detect resolution_hierarchy from weight shapes to avoid loading mismatches
+    state_dict = ckpt_meta.get("model_state_dict", ckpt_meta)
+    detected_resolution_hierarchy = checkpoint_config.get("resolution_hierarchy", False)
+    for key in ["refinement_head.h8_proj.block.0.weight", "refinement_head.proj.block.0.weight"]:
+        if key in state_dict:
+            in_channels = state_dict[key].shape[1]
+            if in_channels == 131:
+                detected_resolution_hierarchy = True
+                logger.info("Auto-detected resolution_hierarchy: True (131 input channels)")
+            elif in_channels == 129:
+                detected_resolution_hierarchy = False
+                logger.info("Auto-detected resolution_hierarchy: False (129 input channels)")
+            break
+
     is_matting = (task_mode == "ddc_matting")
 
     # 2. Dataset Setup
@@ -132,7 +146,7 @@ def evaluate(
             fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
             prompt_detach=checkpoint_config.get("prompt_detach", True),
             uncertainty_floor=checkpoint_config.get("uncertainty_floor", 0.15),
-            resolution_hierarchy=checkpoint_config.get("resolution_hierarchy", False),
+            resolution_hierarchy=detected_resolution_hierarchy,
         ).to(device)
     else:
         model = FastSCNN(num_classes=cfg.num_classes, aux=True).to(device)

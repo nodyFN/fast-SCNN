@@ -561,6 +561,20 @@ def main() -> None:
     checkpoint_config = ckpt.get("config", {})
     task_mode = checkpoint_config.get("task_mode", "segmentation")
 
+    # Auto-detect resolution_hierarchy from weight shapes to avoid loading mismatches
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    detected_resolution_hierarchy = checkpoint_config.get("resolution_hierarchy", False)
+    for key in ["refinement_head.h8_proj.block.0.weight", "refinement_head.proj.block.0.weight"]:
+        if key in state_dict:
+            in_channels = state_dict[key].shape[1]
+            if in_channels == 131:
+                detected_resolution_hierarchy = True
+                print("Auto-detected resolution_hierarchy: True (131 input channels)")
+            elif in_channels == 129:
+                detected_resolution_hierarchy = False
+                print("Auto-detected resolution_hierarchy: False (129 input channels)")
+            break
+
     # Build model (aux=False to load all weights, then wrap for inference)
     if args.model == "fast_scnn_salient":
         model = FastSCNNSalient(
@@ -579,7 +593,7 @@ def main() -> None:
             fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
             prompt_detach=checkpoint_config.get("prompt_detach", True),
             uncertainty_floor=checkpoint_config.get("uncertainty_floor", 0.15),
-            resolution_hierarchy=checkpoint_config.get("resolution_hierarchy", False),
+            resolution_hierarchy=detected_resolution_hierarchy,
         ).to(device)
     else:
         model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)
