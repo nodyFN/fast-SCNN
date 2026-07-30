@@ -58,6 +58,9 @@ def evaluate(
     allow_threshold: bool = False,
     task_mode: str | None = None,
     threshold_sweep: bool = False,
+    trimap_source: str | None = None,
+    trimap_kernel_min: int | None = None,
+    trimap_kernel_max: int | None = None,
 ) -> None:
     cfg = Config()
     cfg.model = model_name
@@ -88,11 +91,15 @@ def evaluate(
     split_dir = cfg.val_dir if split == "val" else cfg.test_dir
     if is_matting:
         transform = build_matting_val_transform(val_height, val_width)
+        t_source = trimap_source if trimap_source is not None else checkpoint_config.get("trimap_source", "binary_mask")
+        t_min = trimap_kernel_min if trimap_kernel_min is not None else checkpoint_config.get("trimap_kernel_min", 1)
+        t_max = trimap_kernel_max if trimap_kernel_max is not None else checkpoint_config.get("trimap_kernel_max", 30)
+        
         dataset = MattingDataset(
             split_dir, transform=transform,
-            trimap_source=checkpoint_config.get("trimap_source", "binary_mask"),
-            trimap_kernel_min=checkpoint_config.get("trimap_kernel_min", 1),
-            trimap_kernel_max=checkpoint_config.get("trimap_kernel_max", 30),
+            trimap_source=t_source,
+            trimap_kernel_min=t_min,
+            trimap_kernel_max=t_max,
             allow_threshold=allow_threshold,
             collapse_nonzero_to_foreground=checkpoint_config.get("collapse_nonzero_to_foreground", False),
         )
@@ -350,6 +357,12 @@ def main() -> None:
                    help="Task mode for evaluation (default: auto-detected from checkpoint)")
     p.add_argument("--threshold-sweep", action="store_true",
                    help="Evaluate validation metrics across multiple threshold candidates")
+    p.add_argument("--trimap-source", choices=["binary_mask", "file"], default=None,
+                   help="Source of trimap: 'binary_mask' (on-the-fly) or 'file' (from trimaps/ dir)")
+    p.add_argument("--trimap-kernel-min", type=int, default=None,
+                   help="Minimum kernel size for trimap generator")
+    p.add_argument("--trimap-kernel-max", type=int, default=None,
+                   help="Maximum kernel size for trimap generator")
     args = p.parse_args()
 
     evaluate(
@@ -368,6 +381,9 @@ def main() -> None:
         allow_threshold=args.allow_threshold,
         task_mode=args.task_mode,
         threshold_sweep=args.threshold_sweep,
+        trimap_source=args.trimap_source,
+        trimap_kernel_min=args.trimap_kernel_min,
+        trimap_kernel_max=args.trimap_kernel_max,
     )
 
 
