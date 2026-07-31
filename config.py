@@ -170,10 +170,10 @@ class Config:
     coarse_bce_weight: float = 1.0
     coarse_dice_weight: float = 1.0
 
-    fine_bce_weight: float = 0.5
-    fine_tversky_weight: float = 1.0
-    fine_boundary_weight: float = 0.25
-    fine_hard_negative_weight: float = 0.25
+    fine_bce_weight: float = 0.0
+    fine_tversky_weight: float = 0.0
+    fine_boundary_weight: float = 0.0
+    fine_hard_negative_weight: float = 0.0
     fine_focal_weight: float = 0.0
     fine_sobel_weight: float = 0.0
 
