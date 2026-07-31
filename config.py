@@ -235,9 +235,9 @@ class Config:
     uncertainty_floor: float = 0.15
     resolution_hierarchy: bool = True
 
-    # Scheduler milestones (for MultiStepLR, used by DDC paper profiles)
     scheduler_milestones: Optional[List[int]] = None
     scheduler_gamma: float = 0.1
+    save_interval: int = 0
 
     def resolve_device(self) -> torch.device:
         """Return the torch.device to use."""

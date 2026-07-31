@@ -1265,6 +1265,13 @@ def train(cfg: Config) -> None:
                     best_miou, history, asdict(cfg), cfg.class_names,
                     cfg.num_classes, cfg.seed,
                 )
+                if cfg.save_interval > 0 and (epoch + 1) % cfg.save_interval == 0:
+                    save_checkpoint(
+                        cfg.checkpoint_dir / f"epoch_{epoch + 1:04d}.pt",
+                        epoch, global_step, model, optimizer, scheduler, scaler,
+                        best_miou, history, asdict(cfg), cfg.class_names,
+                        cfg.num_classes, cfg.seed,
+                    )
             if val_results["miou"] > best_miou:
                 best_miou = val_results["miou"]
                 if rank == 0:
@@ -1400,6 +1407,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scheduler-gamma", type=float, default=None)
     p.add_argument("--vis-interval", type=int, default=None,
                    help="Save validation visualization images every N epochs")
+    p.add_argument("--save-interval", type=int, default=None,
+                   help="Save model checkpoint every N epochs (default: 0, disabled)")
     # Knowledge Distillation (KD) arguments
     p.add_argument("--teacher-weights", type=str, default=None,
                    help="Path to pre-trained UNet teacher weights checkpoint")
@@ -1525,6 +1534,8 @@ def main() -> None:
         cfg.ddc_reduction = args.ddc_reduction
     if args.vis_interval is not None:
         cfg.vis_interval = args.vis_interval
+    if args.save_interval is not None:
+        cfg.save_interval = args.save_interval
     if args.ddc_downsample_factor is not None:
         cfg.ddc_downsample_factor = args.ddc_downsample_factor
     if args.lambda_coarse_known is not None:
