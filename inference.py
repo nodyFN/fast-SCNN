@@ -344,6 +344,7 @@ def infer_single(
     use_cuda_sync: bool = False,
     task_mode: str = "segmentation",
     threshold: float = 0.5,
+    save_model_size: bool = False,
 ) -> Dict[str, float]:
     """Run inference on a single image with timing."""
     timings: Dict[str, float] = {}
@@ -355,6 +356,8 @@ def infer_single(
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise IOError(f"Failed to read image: {image_path}")
+    if save_model_size:
+        image_bgr = cv2.resize(image_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
     original_h, original_w = image_bgr.shape[:2]
     if use_cuda_sync:
         torch.cuda.synchronize()
@@ -480,6 +483,7 @@ def infer_folder(
     merge_arg: Optional[str] = None,
     task_mode: str = "segmentation",
     threshold: float = 0.5,
+    save_model_size: bool = False,
 ) -> None:
     """Run inference on all images in a folder."""
     images = sorted(
@@ -498,7 +502,7 @@ def infer_folder(
             timings = infer_single(
                 model, img_path, device, height, width, output_dir,
                 model_name=model_name, gt_arg=gt_arg, merge_arg=merge_arg, use_cuda_sync=use_cuda_sync,
-                task_mode=task_mode, threshold=threshold,
+                task_mode=task_mode, threshold=threshold, save_model_size=save_model_size,
             )
             all_model_ms.append(timings["model_ms"])
             all_e2e_ms.append(timings["e2e_ms"])
@@ -543,6 +547,8 @@ def main() -> None:
     p.add_argument("--width", type=int, default=1024, help="Model input width")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--num-classes", type=int, default=2)
+    p.add_argument("--save-model-size", action="store_true",
+                   help="Save outputs at the model's internal input size (e.g. 224x128) instead of resizing back to original size")
     args = p.parse_args()
 
     if args.device == "auto":
@@ -611,7 +617,7 @@ def main() -> None:
         infer_folder(
             model, input_path, device, args.height, args.width, output_dir,
             model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
-            task_mode=task_mode, threshold=threshold,
+            task_mode=task_mode, threshold=threshold, save_model_size=args.save_model_size,
         )
     elif input_path.is_file():
         use_cuda_sync = device.type == "cuda"
@@ -619,6 +625,7 @@ def main() -> None:
             model, input_path, device, args.height, args.width,
             output_dir, model_name=args.model, gt_arg=args.gt, merge_arg=args.merge,
             use_cuda_sync=use_cuda_sync, task_mode=task_mode, threshold=threshold,
+            save_model_size=args.save_model_size,
         )
         print(f"\nTiming breakdown:")
         for k, v in timings.items():
