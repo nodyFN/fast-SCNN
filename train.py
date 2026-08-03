@@ -1430,6 +1430,10 @@ def parse_args() -> argparse.Namespace:
                    help="Detach coarse logits when building guidance maps")
     p.add_argument("--no-prompt-detach", action="store_false", dest="prompt_detach", default=None,
                    help="Do not detach coarse logits when building guidance maps")
+    p.add_argument("--resolution-hierarchy", action="store_true", dest="resolution_hierarchy", default=None,
+                   help="Use resolution hierarchy (2-stage) structure")
+    p.add_argument("--no-resolution-hierarchy", action="store_false", dest="resolution_hierarchy", default=None,
+                   help="Disable resolution hierarchy (use 1-stage Dual Head) structure")
     p.add_argument("--uncertainty-floor", type=float, default=None,
                    help="Minimum value (floor) for the detail gate")
     return p.parse_args()
@@ -1590,6 +1594,8 @@ def main() -> None:
         cfg.prompt_detach = args.prompt_detach
     if args.uncertainty_floor is not None:
         cfg.uncertainty_floor = args.uncertainty_floor
+    if args.resolution_hierarchy is not None:
+        cfg.resolution_hierarchy = args.resolution_hierarchy
 
     # Generate timestamp and redirect config directories
     from datetime import datetime
