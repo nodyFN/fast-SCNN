@@ -6,7 +6,7 @@ def make_orig_layers():
     # Original Fast-SCNN layers at 224x128 resolution
     layers = [
         # LtD
-        ("Stage 1 (Fine)", "backbone.learning_to_downsample.conv.block.0", "Conv2d", "(1, 3, 128, 224)", "(1, 32, 64, 112)", "(3, 3)", "(2, 2)", 6220800),
+        ("Stage 1 (Fine)", "backbone.learning_to_downsample.conv.block.0", "Conv2d", "(1, 3, 128, 224)", "(1, 32, 64, 112)", "(3, 3)", "(2, 2)", 6193152),
         ("Stage 1 (Fine)", "backbone.learning_to_downsample.dsconv1.depthwise", "Conv2d", "(1, 32, 64, 112)", "(1, 32, 32, 56)", "(3, 3)", "(2, 2)", 516096),
         ("Stage 1 (Fine)", "backbone.learning_to_downsample.dsconv1.pointwise", "Conv2d", "(1, 32, 32, 56)", "(1, 48, 32, 56)", "(1, 1)", "(1, 1)", 2752512),
         ("Stage 1 (Fine)", "backbone.learning_to_downsample.dsconv2.depthwise", "Conv2d", "(1, 48, 32, 56)", "(1, 48, 16, 28)", "(3, 3)", "(2, 2)", 193536),
