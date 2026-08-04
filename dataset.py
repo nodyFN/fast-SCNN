@@ -450,6 +450,7 @@ class MattingDataset(Dataset):
         # Convert mask to binary {0, 1}
         mask = self._convert_mask(mask, mask_path)
 
+        trimap_from_file = None
         if self.trimap_source == "file":
             from utils.trimap import load_trimap_from_file
             # Search for the trimap file dynamically among common extensions
