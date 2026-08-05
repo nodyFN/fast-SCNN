@@ -791,7 +791,7 @@ def compute_kd_loss(
         else:
             raise ValueError(f"Unknown kd_loss_type: {loss_type}")
     else:
-        s_logits = student_out
+        s_logits = student_out["out"] if isinstance(student_out, dict) else student_out
         t_logits = teacher_out
         if loss_type == "kl":
             s_log_prob = F.log_softmax(s_logits / temp, dim=1)
