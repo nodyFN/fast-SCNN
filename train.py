@@ -596,6 +596,7 @@ def run_smoke_test(cfg: Config) -> None:
             fine_dropout=cfg.fine_dropout,
             prompt_detach=getattr(cfg, "prompt_detach", True),
             uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
+            resolution_hierarchy=getattr(cfg, "resolution_hierarchy", True),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
@@ -889,6 +890,7 @@ def train(cfg: Config) -> None:
             fine_dropout=cfg.fine_dropout,
             prompt_detach=getattr(cfg, "prompt_detach", True),
             uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
+            resolution_hierarchy=getattr(cfg, "resolution_hierarchy", True),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
