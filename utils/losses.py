@@ -793,6 +793,8 @@ def compute_kd_loss(
     else:
         s_logits = student_out["out"] if isinstance(student_out, dict) else student_out
         t_logits = teacher_out
+        if s_logits.shape[1] == 2 and t_logits.shape[1] == 1:
+            t_logits = torch.cat([torch.zeros_like(t_logits), t_logits], dim=1)
         if loss_type == "kl":
             s_log_prob = F.log_softmax(s_logits / temp, dim=1)
             t_prob = F.softmax(t_logits / temp, dim=1)
