@@ -230,6 +230,13 @@ class Config:
     kd_loss_type: str = "mse"  # "mse" | "l1" | "kl"
     kd_mode: str = "online"  # "online" | "offline"
     kd_teacher_type: str = "unet"  # "unet" | "birefnet"
+    kd_objective: str = "legacy"  # "legacy" | "dual_head_softmap"
+    kd_coarse_gt_weight: float = 1.0
+    kd_fine_gt_weight: float = 0.0
+    kd_fine_map_weight: float = 1.0
+    kd_fine_soft_bce_weight: float = 0.5
+    kd_fine_gradient_weight: float = 0.25
+    kd_edge_extra_weight: float = 4.0
     mask_subdir: str = "masks"
     load_as_alpha: bool = False
     prompt_detach: bool = True

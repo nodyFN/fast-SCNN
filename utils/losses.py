@@ -805,3 +805,56 @@ def compute_kd_loss(
             return F.l1_loss(F.softmax(s_logits / temp, dim=1), F.softmax(t_logits / temp, dim=1))
         else:
             raise ValueError(f"Unknown kd_loss_type: {loss_type}")
+
+
+class SobelGradient(nn.Module):
+    """Sobel Gradient operator for continuous probability maps."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        kernel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        kernel_y = kernel_x.transpose(2, 3)
+        self.register_buffer("kernel_x", kernel_x)
+        self.register_buffer("kernel_y", kernel_y)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [B, 1, H, W]
+        x_padded = F.pad(x, (1, 1, 1, 1), mode="replicate")
+        grad_x = F.conv2d(
+            x_padded, self.kernel_x.to(device=x.device, dtype=x.dtype)
+        )
+        grad_y = F.conv2d(
+            x_padded, self.kernel_y.to(device=x.device, dtype=x.dtype)
+        )
+        return torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+
+
+def balanced_soft_map_loss(
+    student_prob: torch.Tensor,
+    teacher_prob: torch.Tensor,
+    edge_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute Balanced Soft-Map KD Loss with Teacher Edge weighting.
+
+    Operates per-image to prevent images with large background areas from dominating.
+    """
+    error = torch.abs(student_prob - teacher_prob) * edge_weight
+
+    fg_weight = teacher_prob
+    bg_weight = 1.0 - teacher_prob
+
+    # Sum over spatial dimensions [H, W] and channel (which is 1)
+    fg_loss = (error * fg_weight).sum(dim=(1, 2, 3)) / (
+        fg_weight.sum(dim=(1, 2, 3)).clamp_min(eps)
+    )
+    bg_loss = (error * bg_weight).sum(dim=(1, 2, 3)) / (
+        bg_weight.sum(dim=(1, 2, 3)).clamp_min(eps)
+    )
+
+    loss = 0.5 * (fg_loss + bg_loss)
+    return loss.mean()
+

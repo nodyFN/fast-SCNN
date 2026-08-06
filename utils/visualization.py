@@ -139,6 +139,11 @@ def visualize_segmentation(
     teacher_maps: Optional[torch.Tensor] = None,
     orig_sizes: Optional[torch.Tensor] = None,
     upsample_to_original: bool = False,
+    coarse_probs: Optional[torch.Tensor] = None,
+    fine_probs: Optional[torch.Tensor] = None,
+    abs_diff: Optional[torch.Tensor] = None,
+    teacher_grad: Optional[torch.Tensor] = None,
+    student_grad: Optional[torch.Tensor] = None,
 ) -> None:
     """Visualize segmentation results.
 
@@ -154,6 +159,11 @@ def visualize_segmentation(
     teacher_maps : [B, H, W] float, optional teacher probability map
     orig_sizes : [B, 2] int, optional original sizes before resize
     upsample_to_original : bool, if True upsample back to orig_size
+    coarse_probs : [B, H, W] float, optional coarse probability map
+    fine_probs : [B, H, W] float, optional fine probability map
+    abs_diff : [B, H, W] float, optional absolute difference map
+    teacher_grad : [B, H, W] float, optional teacher gradient map
+    student_grad : [B, H, W] float, optional student gradient map
     """
     if class_colors is None:
         class_colors = {0: (0, 0, 0), 1: (0, 255, 0)}  # black BG, green FG
@@ -167,6 +177,16 @@ def visualize_segmentation(
         ncols += 1
     if teacher_maps is not None:
         ncols += 1
+    if coarse_probs is not None:
+        ncols += 1
+    if fine_probs is not None:
+        ncols += 1
+    if abs_diff is not None:
+        ncols += 1
+    if teacher_grad is not None:
+        ncols += 1
+    if student_grad is not None:
+        ncols += 1
         
     fig, axes = plt.subplots(n, ncols, figsize=(ncols * 4, n * 3.5))
     if n == 1:
@@ -179,6 +199,16 @@ def visualize_segmentation(
         col_titles.append("Alpha Map")
     if teacher_maps is not None:
         col_titles.append("Teacher Map")
+    if coarse_probs is not None:
+        col_titles.append("Coarse Prob")
+    if fine_probs is not None:
+        col_titles.append("Fine Prob")
+    if abs_diff is not None:
+        col_titles.append("Abs Diff")
+    if teacher_grad is not None:
+        col_titles.append("Teacher Grad")
+    if student_grad is not None:
+        col_titles.append("Student Grad")
     col_titles.append("Overlay")
 
     for row in range(n):
@@ -246,6 +276,61 @@ def visualize_segmentation(
                 h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
                 t_map = cv2.resize(t_map, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(t_map, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if coarse_probs is not None:
+            c_prob = coarse_probs[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                c_prob = cv2.resize(c_prob, (w, h), interpolation=cv2.INTER_LINEAR)
+            axes[row, col].imshow(c_prob, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if fine_probs is not None:
+            f_prob = fine_probs[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                f_prob = cv2.resize(f_prob, (w, h), interpolation=cv2.INTER_LINEAR)
+            axes[row, col].imshow(f_prob, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if abs_diff is not None:
+            diff = abs_diff[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                diff = cv2.resize(diff, (w, h), interpolation=cv2.INTER_LINEAR)
+            axes[row, col].imshow(diff, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if teacher_grad is not None:
+            t_grad = teacher_grad[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                t_grad = cv2.resize(t_grad, (w, h), interpolation=cv2.INTER_LINEAR)
+            axes[row, col].imshow(t_grad, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if student_grad is not None:
+            s_grad = student_grad[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                s_grad = cv2.resize(s_grad, (w, h), interpolation=cv2.INTER_LINEAR)
+            axes[row, col].imshow(s_grad, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
             col += 1

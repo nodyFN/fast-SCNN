@@ -54,7 +54,7 @@ from dataset import (
 from models import FastSCNN, FastSCNNSalient, UNet, UNetSalientAdapter, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
-from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss, SobelGradient, balanced_soft_map_loss
 from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
 from utils.birefnet_loader import load_birefnet_teacher
@@ -161,6 +161,10 @@ def train_one_epoch(
     running = {}
     num_batches = 0
 
+    sobel_op = None
+    if getattr(cfg, "kd_objective", "legacy") == "dual_head_softmap" and teacher is not None:
+        sobel_op = SobelGradient().to(device)
+
     # Disable progress bar on non-master ranks to avoid output clutter, or if no_tqdm is requested
     disable_tqdm = (os.environ.get("RANK", "0") != "0") or getattr(cfg, 'no_tqdm', False)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=disable_tqdm)
@@ -192,19 +196,83 @@ def train_one_epoch(
                     if isinstance(teacher_out, (list, tuple)):
                         teacher_out = teacher_out[-1]
                 
-                is_sal = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
-                kd_loss = compute_kd_loss(
-                    student_out=output,
-                    teacher_out=teacher_out,
-                    loss_type=getattr(cfg, "kd_loss_type", "mse"),
-                    temp=getattr(cfg, "kd_temperature", 1.0),
-                    is_salient=is_sal,
-                )
-                
-                alpha = getattr(cfg, "kd_alpha", 0.5)
-                losses["student_total"] = losses["total"]
-                losses["kd"] = kd_loss
-                losses["total"] = (1.0 - alpha) * losses["student_total"] + alpha * kd_loss
+                if getattr(cfg, "kd_objective", "legacy") == "dual_head_softmap":
+                    teacher_prob = torch.sigmoid(teacher_out).detach()
+                    student_fine_logits = output["fine_logits"]
+                    if teacher_prob.shape[-2:] != student_fine_logits.shape[-2:]:
+                        teacher_prob = F.interpolate(
+                            teacher_prob,
+                            size=student_fine_logits.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    
+                    student_fine_prob = torch.sigmoid(student_fine_logits)
+                    
+                    coarse_gt_loss = losses.get("coarse_total", torch.tensor(0.0, device=device))
+                    fine_gt_loss = losses.get("fine_total", torch.tensor(0.0, device=device))
+                    
+                    # Sobel edge weighting
+                    teacher_edge = sobel_op(teacher_prob).detach()
+                    teacher_edge = teacher_edge / teacher_edge.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+                    edge_weight = 1.0 + cfg.kd_edge_extra_weight * teacher_edge
+                    
+                    fine_kd_map = balanced_soft_map_loss(student_fine_prob, teacher_prob, edge_weight)
+                    
+                    fine_kd_soft_bce = F.binary_cross_entropy_with_logits(student_fine_logits, teacher_prob)
+                    
+                    student_gradient = sobel_op(student_fine_prob)
+                    teacher_gradient = sobel_op(teacher_prob).detach()
+                    fine_kd_gradient = F.l1_loss(student_gradient, teacher_gradient)
+                    
+                    losses["coarse_gt"] = coarse_gt_loss
+                    losses["fine_gt"] = fine_gt_loss
+                    losses["kd_map"] = fine_kd_map
+                    losses["kd_soft_bce"] = fine_kd_soft_bce
+                    losses["kd_gradient"] = fine_kd_gradient
+                    
+                    losses["total"] = (
+                        cfg.kd_coarse_gt_weight * coarse_gt_loss
+                        + cfg.kd_fine_gt_weight * fine_gt_loss
+                        + cfg.kd_fine_map_weight * fine_kd_map
+                        + cfg.kd_fine_soft_bce_weight * fine_kd_soft_bce
+                        + cfg.kd_fine_gradient_weight * fine_kd_gradient
+                    )
+                    
+                    # Compute statistics for logging
+                    with torch.no_grad():
+                        teacher_prob_mean = teacher_prob.mean()
+                        student_prob_mean = student_fine_prob.mean()
+                        
+                        teacher_fg_mask = teacher_prob >= 0.5
+                        teacher_bg_mask = teacher_prob < 0.5
+                        
+                        teacher_fg_mean = teacher_prob[teacher_fg_mask].mean() if teacher_fg_mask.any() else torch.tensor(0.0, device=device)
+                        student_fg_mean = student_fine_prob[teacher_fg_mask].mean() if teacher_fg_mask.any() else torch.tensor(0.0, device=device)
+                        
+                        teacher_bg_mean = teacher_prob[teacher_bg_mask].mean() if teacher_bg_mask.any() else torch.tensor(0.0, device=device)
+                        student_bg_mean = student_fine_prob[teacher_bg_mask].mean() if teacher_bg_mask.any() else torch.tensor(0.0, device=device)
+                        
+                    losses["teacher_prob_mean"] = teacher_prob_mean
+                    losses["student_prob_mean"] = student_prob_mean
+                    losses["teacher_fg_mean"] = teacher_fg_mean
+                    losses["student_fg_mean"] = student_fg_mean
+                    losses["teacher_bg_mean"] = teacher_bg_mean
+                    losses["student_bg_mean"] = student_bg_mean
+                else:
+                    is_sal = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
+                    kd_loss = compute_kd_loss(
+                        student_out=output,
+                        teacher_out=teacher_out,
+                        loss_type=getattr(cfg, "kd_loss_type", "mse"),
+                        temp=getattr(cfg, "kd_temperature", 1.0),
+                        is_salient=is_sal,
+                    )
+                    
+                    alpha = getattr(cfg, "kd_alpha", 0.5)
+                    losses["student_total"] = losses["total"]
+                    losses["kd"] = kd_loss
+                    losses["total"] = (1.0 - alpha) * losses["student_total"] + alpha * kd_loss
 
         total_loss = losses["total"]
 
@@ -1201,7 +1269,10 @@ def train(cfg: Config) -> None:
                 writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
                 for k, v in train_losses.items():
                     if k != "total":
-                        writer.add_scalar(f"Loss/{k}", v, epoch)
+                        if k in ["coarse_gt", "fine_gt", "kd_map", "kd_soft_bce", "kd_gradient", "teacher_prob_mean", "student_prob_mean", "teacher_fg_mean", "student_fg_mean", "teacher_bg_mean", "student_bg_mean"]:
+                            writer.add_scalar(f"train/{k}", v, epoch)
+                        else:
+                            writer.add_scalar(f"Loss/{k}", v, epoch)
                 if not is_matting:
                     writer.add_scalar("Metrics/pixel_accuracy", val_results["pixel_accuracy"], epoch)
                     writer.add_scalar("Metrics/miou", val_results["miou"], epoch)
@@ -1228,14 +1299,37 @@ def train(cfg: Config) -> None:
                             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                                 preds_outputs = model(imgs)
                                 teacher_maps = None
+                                coarse_probs = None
+                                fine_probs = None
+                                abs_diff = None
+                                teacher_grad = None
+                                student_grad = None
                                 if teacher is not None:
                                     teacher_out = teacher(imgs)
                                     if isinstance(teacher_out, (list, tuple)):
                                         teacher_out = teacher_out[-1]
                                     if getattr(cfg, "kd_teacher_type", "unet") == "birefnet" or "salient" in getattr(cfg, "loss_profile", ""):
-                                        teacher_maps = torch.sigmoid(teacher_out).squeeze(1)
+                                        teacher_prob_raw = torch.sigmoid(teacher_out)
                                     else:
-                                        teacher_maps = torch.softmax(teacher_out, dim=1)[:, 1]
+                                        teacher_prob_raw = torch.softmax(teacher_out, dim=1)[:, 1:2]
+                                    
+                                    if teacher_prob_raw.shape[-2:] != imgs.shape[-2:]:
+                                        teacher_prob_raw = F.interpolate(
+                                            teacher_prob_raw,
+                                            size=imgs.shape[-2:],
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                    teacher_maps = teacher_prob_raw.squeeze(1)
+                                    
+                                if getattr(cfg, "kd_objective", "legacy") == "dual_head_softmap" and teacher is not None:
+                                    coarse_probs = preds_outputs["coarse_prob"].squeeze(1)
+                                    fine_probs = preds_outputs["fine_prob"].squeeze(1)
+                                    abs_diff = torch.abs(teacher_maps - fine_probs)
+                                    
+                                    vis_sobel = SobelGradient().to(device)
+                                    teacher_grad = vis_sobel(teacher_maps.unsqueeze(1)).squeeze(1)
+                                    student_grad = vis_sobel(fine_probs.unsqueeze(1)).squeeze(1)
                         orig_sizes = sample_batch.get("orig_size", None)
                         if is_matting:
                             visualize_matting(
@@ -1265,6 +1359,11 @@ def train(cfg: Config) -> None:
                                 teacher_maps=teacher_maps,
                                 orig_sizes=orig_sizes,
                                 upsample_to_original=cfg.val_vis_upsample,
+                                coarse_probs=coarse_probs,
+                                fine_probs=fine_probs,
+                                abs_diff=abs_diff,
+                                teacher_grad=teacher_grad,
+                                student_grad=student_grad,
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                             )
@@ -1441,6 +1540,20 @@ def parse_args() -> argparse.Namespace:
                    help="KD training mode: online (on-the-fly teacher) or offline (pre-generated matts)")
     p.add_argument("--kd-teacher-type", choices=["unet", "birefnet"], default=None,
                    help="Teacher model architecture")
+    p.add_argument("--kd-objective", choices=["legacy", "dual_head_softmap"], default=None,
+                   help="KD objective mode: legacy (alpha-blended student/KD loss) or dual_head_softmap")
+    p.add_argument("--kd-coarse-gt-weight", type=float, default=None,
+                   help="Coarse GT loss weight in dual_head_softmap KD")
+    p.add_argument("--kd-fine-gt-weight", type=float, default=None,
+                   help="Fine GT loss weight in dual_head_softmap KD")
+    p.add_argument("--kd-fine-map-weight", type=float, default=None,
+                   help="Fine balanced soft-map KD loss weight")
+    p.add_argument("--kd-fine-soft-bce-weight", type=float, default=None,
+                   help="Fine soft BCE KD loss weight")
+    p.add_argument("--kd-fine-gradient-weight", type=float, default=None,
+                   help="Fine gradient KD loss weight")
+    p.add_argument("--kd-edge-extra-weight", type=float, default=None,
+                   help="Extra boundary emphasis weight for teacher edge map")
     p.add_argument("--mask-subdir", type=str, default=None,
                    help="Subdirectory under dataset root containing ground truth masks/alphas")
     p.add_argument("--load-as-alpha", action="store_true", default=None,
@@ -1617,6 +1730,24 @@ def main() -> None:
         cfg.resolution_hierarchy = args.resolution_hierarchy
     if args.val_vis_upsample is not None:
         cfg.val_vis_upsample = args.val_vis_upsample
+    if args.kd_objective is not None:
+        cfg.kd_objective = args.kd_objective
+    if args.kd_coarse_gt_weight is not None:
+        cfg.kd_coarse_gt_weight = args.kd_coarse_gt_weight
+    if args.kd_fine_gt_weight is not None:
+        cfg.kd_fine_gt_weight = args.kd_fine_gt_weight
+    if args.kd_fine_map_weight is not None:
+        cfg.kd_fine_map_weight = args.kd_fine_map_weight
+    if args.kd_fine_soft_bce_weight is not None:
+        cfg.kd_fine_soft_bce_weight = args.kd_fine_soft_bce_weight
+    if args.kd_fine_gradient_weight is not None:
+        cfg.kd_fine_gradient_weight = args.kd_fine_gradient_weight
+    if args.kd_edge_extra_weight is not None:
+        cfg.kd_edge_extra_weight = args.kd_edge_extra_weight
+
+    # Warn about ignored kd-alpha if dual_head_softmap is used
+    if cfg.kd_objective == "dual_head_softmap" and args.kd_alpha is not None:
+        logger.warning("kd_alpha is ignored when kd_objective=dual_head_softmap")
 
     # Generate timestamp and redirect config directories
     from datetime import datetime
