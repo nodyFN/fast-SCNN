@@ -137,6 +137,8 @@ def visualize_segmentation(
     class_colors: Optional[Dict[int, tuple]] = None,
     alpha_maps: Optional[torch.Tensor] = None,
     teacher_maps: Optional[torch.Tensor] = None,
+    orig_sizes: Optional[torch.Tensor] = None,
+    upsample_to_original: bool = False,
 ) -> None:
     """Visualize segmentation results.
 
@@ -150,6 +152,8 @@ def visualize_segmentation(
     num_samples : max number of samples to plot
     alpha_maps : [B, H, W] float, optional continuous alpha map
     teacher_maps : [B, H, W] float, optional teacher probability map
+    orig_sizes : [B, 2] int, optional original sizes before resize
+    upsample_to_original : bool, if True upsample back to orig_size
     """
     if class_colors is None:
         class_colors = {0: (0, 0, 0), 1: (0, 255, 0)}  # black BG, green FG
@@ -183,6 +187,13 @@ def visualize_segmentation(
         gt = masks_gt[row].cpu().numpy()
         pred = masks_pred[row].cpu().numpy()
 
+        if upsample_to_original and orig_sizes is not None:
+            import cv2
+            h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            gt = cv2.resize(gt.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            pred = cv2.resize(pred.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
         # Color masks
         gt_color = _colorize_mask(gt, class_colors)
         pred_color = _colorize_mask(pred, class_colors)
@@ -208,6 +219,10 @@ def visualize_segmentation(
 
         if probs_fg is not None:
             prob = probs_fg[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                prob = cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(prob, cmap="hot", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
@@ -215,6 +230,10 @@ def visualize_segmentation(
 
         if alpha_maps is not None:
             alpha = alpha_maps[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(alpha, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
@@ -222,6 +241,10 @@ def visualize_segmentation(
 
         if teacher_maps is not None:
             t_map = teacher_maps[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                t_map = cv2.resize(t_map, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(t_map, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
@@ -262,6 +285,8 @@ def visualize_matting(
     save_path: Optional[Path | str] = None,
     num_samples: int = 4,
     threshold: float = 0.5,
+    orig_sizes: Optional[torch.Tensor] = None,
+    upsample_to_original: bool = False,
 ) -> None:
     """Visualize matting training results.
 
@@ -273,6 +298,8 @@ def visualize_matting(
     fine_alpha : [B, 1, H, W]  [0, 1]
     ddc_images : [B, 3, H, W]  raw RGB [0, 1], optional
     gt_alpha : [B, 1, H, W]  ground truth alpha, optional
+    orig_sizes : [B, 2] int, optional original sizes before resize
+    upsample_to_original : bool, if True upsample back to orig_size
     """
     n = min(num_samples, images.shape[0])
     has_gt = gt_alpha is not None
@@ -286,6 +313,17 @@ def visualize_matting(
     for row in range(n):
         col = 0
         img = denormalize(images[row].cpu().numpy())
+        tri = trimaps[row, 0].cpu().numpy()
+        ca = coarse_alpha[row, 0].cpu().numpy()
+        fa = fine_alpha[row, 0].cpu().numpy()
+
+        if upsample_to_original and orig_sizes is not None:
+            import cv2
+            h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            tri = cv2.resize(tri, (w, h), interpolation=cv2.INTER_NEAREST)
+            ca = cv2.resize(ca, (w, h), interpolation=cv2.INTER_LINEAR)
+            fa = cv2.resize(fa, (w, h), interpolation=cv2.INTER_LINEAR)
 
         # 1. Original RGB
         axes[row, col].imshow(img)
@@ -295,7 +333,6 @@ def visualize_matting(
         col += 1
 
         # 2. Trimap (color-coded)
-        tri = trimaps[row, 0].cpu().numpy()
         tri_rgb = np.zeros((*tri.shape, 3), dtype=np.float32)
         tri_rgb[tri > 0.75] = [1, 1, 1]  # FG = white
         tri_rgb[(tri > 0.25) & (tri < 0.75)] = [0.5, 0.5, 0.5]  # Unknown = gray
@@ -307,7 +344,6 @@ def visualize_matting(
         col += 1
 
         # 3. Coarse Alpha
-        ca = coarse_alpha[row, 0].cpu().numpy()
         axes[row, col].imshow(ca, cmap="gray", vmin=0, vmax=1)
         if row == 0:
             axes[row, col].set_title("Coarse α", fontsize=8)
@@ -315,7 +351,6 @@ def visualize_matting(
         col += 1
 
         # 4. Fine Alpha
-        fa = fine_alpha[row, 0].cpu().numpy()
         axes[row, col].imshow(fa, cmap="gray", vmin=0, vmax=1)
         if row == 0:
             axes[row, col].set_title("Fine α", fontsize=8)
@@ -341,6 +376,10 @@ def visualize_matting(
         # 7. DDC RGB (if available)
         if has_ddc:
             ddc_rgb = ddc_images[row].cpu().numpy().transpose(1, 2, 0)
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                ddc_rgb = cv2.resize(ddc_rgb, (w, h), interpolation=cv2.INTER_LANCZOS4)
             axes[row, col].imshow(ddc_rgb.clip(0, 1))
             if row == 0:
                 axes[row, col].set_title("DDC RGB", fontsize=8)
@@ -350,6 +389,10 @@ def visualize_matting(
         # 8-9. GT Alpha + Error (if available)
         if has_gt:
             gta = gt_alpha[row, 0].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                gta = cv2.resize(gta, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(gta, cmap="gray", vmin=0, vmax=1)
             if row == 0:
                 axes[row, col].set_title("GT α", fontsize=8)

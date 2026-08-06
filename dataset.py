@@ -124,6 +124,7 @@ class SegmentationDataset(Dataset):
         if image is None:
             raise IOError(f"Failed to read image: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
 
         # Read mask (single-channel)
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -157,7 +158,11 @@ class SegmentationDataset(Dataset):
         else:
             mask = mask.long()
 
-        return {"image": image, "mask": mask}
+        return {
+            "image": image,
+            "mask": mask,
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int32),
+        }
 
     def _convert_mask(self, mask: np.ndarray, path: Path) -> np.ndarray:
         """Validate and convert mask to {0, 1} uint8."""
@@ -441,6 +446,7 @@ class MattingDataset(Dataset):
         if image is None:
             raise IOError(f"Failed to read image: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
 
         # Read mask (single-channel)
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -536,6 +542,7 @@ class MattingDataset(Dataset):
             "ddc_image": ddc_image,
             "mask": mask_tensor.squeeze(0).long().squeeze(0),  # [H, W] long for compat
             "trimap": trimap_tensor,  # [1, H, W] float {0.0, 0.5, 1.0}
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int32),
         }
 
     def _convert_mask(self, mask: np.ndarray, path: Path) -> np.ndarray:

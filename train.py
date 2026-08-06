@@ -1236,6 +1236,7 @@ def train(cfg: Config) -> None:
                                         teacher_maps = torch.sigmoid(teacher_out).squeeze(1)
                                     else:
                                         teacher_maps = torch.softmax(teacher_out, dim=1)[:, 1]
+                        orig_sizes = sample_batch.get("orig_size", None)
                         if is_matting:
                             visualize_matting(
                                 images=imgs,
@@ -1246,6 +1247,8 @@ def train(cfg: Config) -> None:
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                                 threshold=cfg.foreground_threshold,
+                                orig_sizes=orig_sizes,
+                                upsample_to_original=cfg.val_vis_upsample,
                             )
                         else:
                             if cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")):
@@ -1260,6 +1263,8 @@ def train(cfg: Config) -> None:
                                 imgs, msks, preds, probs,
                                 alpha_maps=alpha_maps,
                                 teacher_maps=teacher_maps,
+                                orig_sizes=orig_sizes,
+                                upsample_to_original=cfg.val_vis_upsample,
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                             )
@@ -1419,6 +1424,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scheduler-gamma", type=float, default=None)
     p.add_argument("--vis-interval", type=int, default=None,
                    help="Save validation visualization images every N epochs")
+    p.add_argument("--val-vis-upsample", action="store_true", default=None,
+                   help="Upsample validation visualization outputs back to original image size")
     p.add_argument("--save-interval", type=int, default=None,
                    help="Save model checkpoint every N epochs (default: 0, disabled)")
     # Knowledge Distillation (KD) arguments
@@ -1608,6 +1615,8 @@ def main() -> None:
         cfg.uncertainty_floor = args.uncertainty_floor
     if args.resolution_hierarchy is not None:
         cfg.resolution_hierarchy = args.resolution_hierarchy
+    if args.val_vis_upsample is not None:
+        cfg.val_vis_upsample = args.val_vis_upsample
 
     # Generate timestamp and redirect config directories
     from datetime import datetime
