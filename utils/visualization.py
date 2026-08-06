@@ -136,6 +136,7 @@ def visualize_segmentation(
     num_samples: int = 4,
     class_colors: Optional[Dict[int, tuple]] = None,
     alpha_maps: Optional[torch.Tensor] = None,
+    teacher_maps: Optional[torch.Tensor] = None,
 ) -> None:
     """Visualize segmentation results.
 
@@ -148,6 +149,7 @@ def visualize_segmentation(
     save_path : where to save the figure
     num_samples : max number of samples to plot
     alpha_maps : [B, H, W] float, optional continuous alpha map
+    teacher_maps : [B, H, W] float, optional teacher probability map
     """
     if class_colors is None:
         class_colors = {0: (0, 0, 0), 1: (0, 255, 0)}  # black BG, green FG
@@ -159,6 +161,8 @@ def visualize_segmentation(
         ncols += 1
     if alpha_maps is not None:
         ncols += 1
+    if teacher_maps is not None:
+        ncols += 1
         
     fig, axes = plt.subplots(n, ncols, figsize=(ncols * 4, n * 3.5))
     if n == 1:
@@ -169,6 +173,8 @@ def visualize_segmentation(
         col_titles.append("FG Probability")
     if alpha_maps is not None:
         col_titles.append("Alpha Map")
+    if teacher_maps is not None:
+        col_titles.append("Teacher Map")
     col_titles.append("Overlay")
 
     for row in range(n):
@@ -210,6 +216,13 @@ def visualize_segmentation(
         if alpha_maps is not None:
             alpha = alpha_maps[row].cpu().numpy()
             axes[row, col].imshow(alpha, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if teacher_maps is not None:
+            t_map = teacher_maps[row].cpu().numpy()
+            axes[row, col].imshow(t_map, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
             col += 1

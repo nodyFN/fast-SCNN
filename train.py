@@ -1227,6 +1227,15 @@ def train(cfg: Config) -> None:
                         with torch.inference_mode():
                             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                                 preds_outputs = model(imgs)
+                                teacher_maps = None
+                                if teacher is not None:
+                                    teacher_out = teacher(imgs)
+                                    if isinstance(teacher_out, (list, tuple)):
+                                        teacher_out = teacher_out[-1]
+                                    if getattr(cfg, "kd_teacher_type", "unet") == "birefnet" or "salient" in getattr(cfg, "loss_profile", ""):
+                                        teacher_maps = torch.sigmoid(teacher_out).squeeze(1)
+                                    else:
+                                        teacher_maps = torch.softmax(teacher_out, dim=1)[:, 1]
                         if is_matting:
                             visualize_matting(
                                 images=imgs,
@@ -1250,6 +1259,7 @@ def train(cfg: Config) -> None:
                             visualize_segmentation(
                                 imgs, msks, preds, probs,
                                 alpha_maps=alpha_maps,
+                                teacher_maps=teacher_maps,
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                             )
