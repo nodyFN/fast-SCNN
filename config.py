@@ -237,6 +237,12 @@ class Config:
     kd_fine_soft_bce_weight: float = 0.5
     kd_fine_gradient_weight: float = 0.25
     kd_edge_extra_weight: float = 4.0
+    kd_known_region_anchor_weight: float = 0.2
+    kd_known_region_kernel_size: int = 5
+    kd_teacher_fg_reject_threshold: float = 0.2
+    kd_teacher_bg_reject_threshold: float = 0.8
+    kd_disagreement_weight: float = 0.0
+    kd_disagreement_gradient_radius: int = 1
     mask_subdir: str = "masks"
     load_as_alpha: bool = False
     prompt_detach: bool = True

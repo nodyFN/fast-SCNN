@@ -144,6 +144,13 @@ def visualize_segmentation(
     abs_diff: Optional[torch.Tensor] = None,
     teacher_grad: Optional[torch.Tensor] = None,
     student_grad: Optional[torch.Tensor] = None,
+    gt_binary: Optional[torch.Tensor] = None,
+    known_fg: Optional[torch.Tensor] = None,
+    known_bg: Optional[torch.Tensor] = None,
+    teacher_disagreement: Optional[torch.Tensor] = None,
+    teacher_false_negative: Optional[torch.Tensor] = None,
+    teacher_false_positive: Optional[torch.Tensor] = None,
+    kd_valid_weight: Optional[torch.Tensor] = None,
 ) -> None:
     """Visualize segmentation results.
 
@@ -164,6 +171,13 @@ def visualize_segmentation(
     abs_diff : [B, H, W] float, optional absolute difference map
     teacher_grad : [B, H, W] float, optional teacher gradient map
     student_grad : [B, H, W] float, optional student gradient map
+    gt_binary : [B, H, W] float, optional gt binary mask
+    known_fg : [B, H, W] float, optional known foreground mask
+    known_bg : [B, H, W] float, optional known background mask
+    teacher_disagreement : [B, H, W] float, optional disagreement mask
+    teacher_false_negative : [B, H, W] float, optional false negative mask
+    teacher_false_positive : [B, H, W] float, optional false positive mask
+    kd_valid_weight : [B, H, W] float, optional kd valid pixel weights
     """
     if class_colors is None:
         class_colors = {0: (0, 0, 0), 1: (0, 255, 0)}  # black BG, green FG
@@ -187,6 +201,20 @@ def visualize_segmentation(
         ncols += 1
     if student_grad is not None:
         ncols += 1
+    if gt_binary is not None:
+        ncols += 1
+    if known_fg is not None:
+        ncols += 1
+    if known_bg is not None:
+        ncols += 1
+    if teacher_disagreement is not None:
+        ncols += 1
+    if teacher_false_negative is not None:
+        ncols += 1
+    if teacher_false_positive is not None:
+        ncols += 1
+    if kd_valid_weight is not None:
+        ncols += 1
         
     fig, axes = plt.subplots(n, ncols, figsize=(ncols * 4, n * 3.5))
     if n == 1:
@@ -209,6 +237,20 @@ def visualize_segmentation(
         col_titles.append("Teacher Grad")
     if student_grad is not None:
         col_titles.append("Student Grad")
+    if gt_binary is not None:
+        col_titles.append("GT Binary")
+    if known_fg is not None:
+        col_titles.append("Known FG")
+    if known_bg is not None:
+        col_titles.append("Known BG")
+    if teacher_disagreement is not None:
+        col_titles.append("Disagreement")
+    if teacher_false_negative is not None:
+        col_titles.append("Teacher FN")
+    if teacher_false_positive is not None:
+        col_titles.append("Teacher FP")
+    if kd_valid_weight is not None:
+        col_titles.append("KD Valid Weight")
     col_titles.append("Overlay")
 
     for row in range(n):
@@ -331,6 +373,83 @@ def visualize_segmentation(
                 h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
                 s_grad = cv2.resize(s_grad, (w, h), interpolation=cv2.INTER_LINEAR)
             axes[row, col].imshow(s_grad, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if gt_binary is not None:
+            val = gt_binary[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val, (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if known_fg is not None:
+            val = known_fg[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val, (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if known_bg is not None:
+            val = known_bg[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val, (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if teacher_disagreement is not None:
+            val = teacher_disagreement[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if teacher_false_negative is not None:
+            val = teacher_false_negative[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if teacher_false_positive is not None:
+            val = teacher_false_positive[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(col_titles[col] if row == 0 else "")
+            axes[row, col].axis("off")
+            col += 1
+
+        if kd_valid_weight is not None:
+            val = kd_valid_weight[row].cpu().numpy()
+            if upsample_to_original and orig_sizes is not None:
+                import cv2
+                h, w = int(orig_sizes[row][0]), int(orig_sizes[row][1])
+                val = cv2.resize(val, (w, h), interpolation=cv2.INTER_NEAREST)
+            axes[row, col].imshow(val, cmap="gray", vmin=0, vmax=1)
             axes[row, col].set_title(col_titles[col] if row == 0 else "")
             axes[row, col].axis("off")
             col += 1

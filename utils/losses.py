@@ -836,16 +836,17 @@ def balanced_soft_map_loss(
     student_prob: torch.Tensor,
     teacher_prob: torch.Tensor,
     edge_weight: torch.Tensor,
+    kd_pixel_weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Compute Balanced Soft-Map KD Loss with Teacher Edge weighting.
+    """Compute Balanced Soft-Map KD Loss with Teacher Edge and valid pixel weighting.
 
     Operates per-image to prevent images with large background areas from dominating.
     """
-    error = torch.abs(student_prob - teacher_prob) * edge_weight
+    error = torch.abs(student_prob - teacher_prob)
 
-    fg_weight = teacher_prob
-    bg_weight = 1.0 - teacher_prob
+    fg_weight = teacher_prob * edge_weight * kd_pixel_weight
+    bg_weight = (1.0 - teacher_prob) * edge_weight * kd_pixel_weight
 
     # Sum over spatial dimensions [H, W] and channel (which is 1)
     fg_loss = (error * fg_weight).sum(dim=(1, 2, 3)) / (
@@ -855,6 +856,86 @@ def balanced_soft_map_loss(
         bg_weight.sum(dim=(1, 2, 3)).clamp_min(eps)
     )
 
-    loss = 0.5 * (fg_loss + bg_loss)
+    has_fg = (fg_weight.sum(dim=(1, 2, 3)) > 0).float()
+    has_bg = (bg_weight.sum(dim=(1, 2, 3)) > 0).float()
+
+    loss = torch.where(
+        has_fg * has_bg > 0,
+        0.5 * (fg_loss + bg_loss),
+        torch.where(
+            has_fg > 0,
+            fg_loss,
+            torch.where(
+                has_bg > 0,
+                bg_loss,
+                torch.zeros_like(fg_loss)
+            )
+        )
+    )
     return loss.mean()
+
+
+def binary_erode(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Erode binary mask of shape [B, 1, H, W] in pure PyTorch."""
+    if kernel_size <= 1:
+        return mask
+    if kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be odd")
+    return 1.0 - F.max_pool2d(
+        1.0 - mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    )
+
+
+def binary_dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Dilate binary mask of shape [B, 1, H, W] in pure PyTorch."""
+    if radius <= 0:
+        return mask
+    kernel_size = radius * 2 + 1
+    return F.max_pool2d(
+        mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=radius,
+    )
+
+
+def masked_balanced_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    fg_mask: torch.Tensor,
+    bg_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute balanced BCE loss on known foreground and background regions."""
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+
+    fg_sum = (bce * fg_mask).sum(dim=(1, 2, 3))
+    fg_count = fg_mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+    fg_loss = fg_sum / fg_count
+
+    bg_sum = (bce * bg_mask).sum(dim=(1, 2, 3))
+    bg_count = bg_mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+    bg_loss = bg_sum / bg_count
+
+    has_fg = (fg_mask.sum(dim=(1, 2, 3)) > 0).float()
+    has_bg = (bg_mask.sum(dim=(1, 2, 3)) > 0).float()
+
+    sample_loss = torch.where(
+        has_fg * has_bg > 0,
+        0.5 * fg_loss + 0.5 * bg_loss,
+        torch.where(
+            has_fg > 0,
+            fg_loss,
+            torch.where(
+                has_bg > 0,
+                bg_loss,
+                torch.zeros_like(fg_loss)
+            )
+        )
+    )
+    return sample_loss.mean()
+
 

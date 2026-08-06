@@ -55,7 +55,7 @@ from dataset import (
 from models import FastSCNN, FastSCNNSalient, UNet, UNetSalientAdapter, count_parameters
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.ddc_loss import KnownRegionL1Loss, DirectionalDistanceConsistencyLoss
-from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss, SobelGradient, balanced_soft_map_loss
+from utils.losses import CombinedSegmentationLoss, compute_total_loss, SalientSegmentationLoss, PrecisionSalientLoss, compute_kd_loss, SobelGradient, balanced_soft_map_loss, binary_erode, binary_dilate, masked_balanced_bce_with_logits
 from utils.matting_metrics import MattingMetrics
 from utils.metrics import SegmentationMetrics
 from utils.birefnet_loader import load_birefnet_teacher
@@ -210,6 +210,32 @@ def train_one_epoch(
                     
                     student_fine_prob = torch.sigmoid(student_fine_logits)
                     
+                    # Compute known regions
+                    gt_fine = F.interpolate(
+                        targets,
+                        size=student_fine_logits.shape[-2:],
+                        mode="nearest",
+                    )
+                    gt_binary = (gt_fine >= 0.5).float()
+                    
+                    known_fg = binary_erode(gt_binary, kernel_size=cfg.kd_known_region_kernel_size)
+                    gt_background = 1.0 - gt_binary
+                    known_bg = binary_erode(gt_background, kernel_size=cfg.kd_known_region_kernel_size)
+                    
+                    # False positive / False negative detection
+                    teacher_false_negative = (known_fg > 0.5) & (teacher_prob < cfg.kd_teacher_fg_reject_threshold)
+                    teacher_false_positive = (known_bg > 0.5) & (teacher_prob > cfg.kd_teacher_bg_reject_threshold)
+                    teacher_disagreement = teacher_false_negative | teacher_false_positive
+                    teacher_disagreement_f = teacher_disagreement.float()
+                    
+                    # Valid pixel weight
+                    kd_pixel_weight = torch.ones_like(teacher_prob)
+                    kd_pixel_weight = torch.where(
+                        teacher_disagreement,
+                        torch.full_like(kd_pixel_weight, cfg.kd_disagreement_weight),
+                        kd_pixel_weight,
+                    )
+                    
                     coarse_gt_loss = losses.get("coarse_total", torch.tensor(0.0, device=device))
                     fine_gt_loss = losses.get("fine_total", torch.tensor(0.0, device=device))
                     
@@ -218,19 +244,41 @@ def train_one_epoch(
                     teacher_edge = teacher_edge / teacher_edge.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
                     edge_weight = 1.0 + cfg.kd_edge_extra_weight * teacher_edge
                     
-                    fine_kd_map = balanced_soft_map_loss(student_fine_prob, teacher_prob, edge_weight)
+                    # Balanced Soft Map KD
+                    fine_kd_map = balanced_soft_map_loss(student_fine_prob, teacher_prob, edge_weight, kd_pixel_weight)
                     
-                    fine_kd_soft_bce = F.binary_cross_entropy_with_logits(student_fine_logits, teacher_prob)
+                    # Soft BCE KD with pixel weighting
+                    soft_bce = F.binary_cross_entropy_with_logits(student_fine_logits, teacher_prob, reduction="none")
+                    soft_bce = soft_bce * kd_pixel_weight
+                    soft_bce_sum = soft_bce.sum(dim=(1, 2, 3))
+                    soft_bce_count = kd_pixel_weight.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+                    fine_kd_soft_bce = (soft_bce_sum / soft_bce_count).mean()
+                    
+                    # Gradient KD with disagreement dilation
+                    gradient_disagreement = binary_dilate(teacher_disagreement_f, radius=cfg.kd_disagreement_gradient_radius)
+                    gradient_kd_weight = 1.0 - gradient_disagreement * (1.0 - cfg.kd_disagreement_weight)
                     
                     student_gradient = sobel_op(student_fine_prob)
                     teacher_gradient = sobel_op(teacher_prob).detach()
-                    fine_kd_gradient = F.l1_loss(student_gradient, teacher_gradient)
+                    gradient_error = torch.abs(student_gradient - teacher_gradient) * gradient_kd_weight
+                    gradient_sum = gradient_error.sum(dim=(1, 2, 3))
+                    gradient_count = gradient_kd_weight.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+                    fine_kd_gradient = (gradient_sum / gradient_count).mean()
+                    
+                    # Fine Known-Region GT Anchor
+                    fine_known_region_anchor = masked_balanced_bce_with_logits(
+                        logits=student_fine_logits,
+                        targets=gt_binary,
+                        fg_mask=known_fg,
+                        bg_mask=known_bg,
+                    )
                     
                     losses["coarse_gt"] = coarse_gt_loss
                     losses["fine_gt"] = fine_gt_loss
                     losses["kd_map"] = fine_kd_map
                     losses["kd_soft_bce"] = fine_kd_soft_bce
                     losses["kd_gradient"] = fine_kd_gradient
+                    losses["fine_known_region_anchor"] = fine_known_region_anchor
                     
                     losses["total"] = (
                         cfg.kd_coarse_gt_weight * coarse_gt_loss
@@ -238,6 +286,7 @@ def train_one_epoch(
                         + cfg.kd_fine_map_weight * fine_kd_map
                         + cfg.kd_fine_soft_bce_weight * fine_kd_soft_bce
                         + cfg.kd_fine_gradient_weight * fine_kd_gradient
+                        + cfg.kd_known_region_anchor_weight * fine_known_region_anchor
                     )
                     
                     # Compute statistics for logging
@@ -254,12 +303,27 @@ def train_one_epoch(
                         teacher_bg_mean = teacher_prob[teacher_bg_mask].mean() if teacher_bg_mask.any() else torch.tensor(0.0, device=device)
                         student_bg_mean = student_fine_prob[teacher_bg_mask].mean() if teacher_bg_mask.any() else torch.tensor(0.0, device=device)
                         
+                        # Disagreement & Known Region statistics
+                        teacher_disagreement_ratio = teacher_disagreement_f.mean()
+                        teacher_fn_ratio = teacher_false_negative.float().sum() / known_fg.sum().clamp_min(1.0)
+                        teacher_fp_ratio = teacher_false_positive.float().sum() / known_bg.sum().clamp_min(1.0)
+                        known_fg_ratio = known_fg.mean()
+                        known_bg_ratio = known_bg.mean()
+                        kd_valid_ratio = kd_pixel_weight.mean()
+                        
                     losses["teacher_prob_mean"] = teacher_prob_mean
                     losses["student_prob_mean"] = student_prob_mean
                     losses["teacher_fg_mean"] = teacher_fg_mean
                     losses["student_fg_mean"] = student_fg_mean
                     losses["teacher_bg_mean"] = teacher_bg_mean
                     losses["student_bg_mean"] = student_bg_mean
+                    
+                    losses["teacher_disagreement_ratio"] = teacher_disagreement_ratio
+                    losses["teacher_false_negative_ratio"] = teacher_fn_ratio
+                    losses["teacher_false_positive_ratio"] = teacher_fp_ratio
+                    losses["known_fg_ratio"] = known_fg_ratio
+                    losses["known_bg_ratio"] = known_bg_ratio
+                    losses["kd_valid_ratio"] = kd_valid_ratio
                 else:
                     is_sal = (cfg.model == "fast_scnn_salient" or (cfg.model == "unet" and "salient" in getattr(cfg, "loss_profile", "")))
                     kd_loss = compute_kd_loss(
@@ -1270,7 +1334,12 @@ def train(cfg: Config) -> None:
                 writer.add_scalar("Loss/validation", val_results["val_loss"], epoch)
                 for k, v in train_losses.items():
                     if k != "total":
-                        if k in ["coarse_gt", "fine_gt", "kd_map", "kd_soft_bce", "kd_gradient", "teacher_prob_mean", "student_prob_mean", "teacher_fg_mean", "student_fg_mean", "teacher_bg_mean", "student_bg_mean"]:
+                        if k in [
+                            "coarse_gt", "fine_gt", "kd_map", "kd_soft_bce", "kd_gradient",
+                            "teacher_prob_mean", "student_prob_mean", "teacher_fg_mean", "student_fg_mean", "teacher_bg_mean", "student_bg_mean",
+                            "fine_known_region_anchor", "teacher_disagreement_ratio", "teacher_false_negative_ratio", "teacher_false_positive_ratio",
+                            "known_fg_ratio", "known_bg_ratio", "kd_valid_ratio"
+                        ]:
                             writer.add_scalar(f"train/{k}", v, epoch)
                         else:
                             writer.add_scalar(f"Loss/{k}", v, epoch)
@@ -1305,6 +1374,13 @@ def train(cfg: Config) -> None:
                                 abs_diff = None
                                 teacher_grad = None
                                 student_grad = None
+                                gt_binary = None
+                                known_fg = None
+                                known_bg = None
+                                teacher_disagreement = None
+                                teacher_false_negative = None
+                                teacher_false_positive = None
+                                kd_valid_weight = None
                                 if teacher is not None:
                                     teacher_out = teacher(imgs)
                                     if isinstance(teacher_out, (list, tuple)):
@@ -1331,6 +1407,39 @@ def train(cfg: Config) -> None:
                                     vis_sobel = SobelGradient().to(device)
                                     teacher_grad = vis_sobel(teacher_maps.unsqueeze(1)).squeeze(1)
                                     student_grad = vis_sobel(fine_probs.unsqueeze(1)).squeeze(1)
+                                    
+                                    # Create gt_binary from msks
+                                    gt_fine = F.interpolate(
+                                        msks.unsqueeze(1).float(),
+                                        size=imgs.shape[-2:],
+                                        mode="nearest",
+                                    )
+                                    gt_binary = (gt_fine >= 0.5).float()
+                                    
+                                    known_fg = binary_erode(gt_binary, kernel_size=cfg.kd_known_region_kernel_size)
+                                    gt_background = 1.0 - gt_binary
+                                    known_bg = binary_erode(gt_background, kernel_size=cfg.kd_known_region_kernel_size)
+                                    
+                                    # false positive / false negative detection
+                                    teacher_false_negative = (known_fg > 0.5) & (teacher_maps.unsqueeze(1) < cfg.kd_teacher_fg_reject_threshold)
+                                    teacher_false_positive = (known_bg > 0.5) & (teacher_maps.unsqueeze(1) > cfg.kd_teacher_bg_reject_threshold)
+                                    teacher_disagreement = teacher_false_negative | teacher_false_positive
+                                    
+                                    kd_valid_weight = torch.ones_like(teacher_maps.unsqueeze(1))
+                                    kd_valid_weight = torch.where(
+                                        teacher_disagreement,
+                                        torch.full_like(kd_valid_weight, cfg.kd_disagreement_weight),
+                                        kd_valid_weight,
+                                    )
+                                    
+                                    # Squeeze channel dimension for visualization mapping
+                                    gt_binary = gt_binary.squeeze(1)
+                                    known_fg = known_fg.squeeze(1)
+                                    known_bg = known_bg.squeeze(1)
+                                    teacher_disagreement = teacher_disagreement.squeeze(1)
+                                    teacher_false_negative = teacher_false_negative.squeeze(1)
+                                    teacher_false_positive = teacher_false_positive.squeeze(1)
+                                    kd_valid_weight = kd_valid_weight.squeeze(1)
                         orig_sizes = sample_batch.get("orig_size", None)
                         if is_matting:
                             visualize_matting(
@@ -1365,6 +1474,13 @@ def train(cfg: Config) -> None:
                                 abs_diff=abs_diff,
                                 teacher_grad=teacher_grad,
                                 student_grad=student_grad,
+                                gt_binary=gt_binary,
+                                known_fg=known_fg,
+                                known_bg=known_bg,
+                                teacher_disagreement=teacher_disagreement,
+                                teacher_false_negative=teacher_false_negative,
+                                teacher_false_positive=teacher_false_positive,
+                                kd_valid_weight=kd_valid_weight,
                                 save_path=cfg.training_image_dir / f"epoch_{epoch:04d}.png",
                                 num_samples=cfg.num_vis_samples,
                             )
@@ -1555,6 +1671,18 @@ def parse_args() -> argparse.Namespace:
                    help="Fine gradient KD loss weight")
     p.add_argument("--kd-edge-extra-weight", type=float, default=None,
                    help="Extra boundary emphasis weight for teacher edge map")
+    p.add_argument("--kd-known-region-anchor-weight", type=float, default=None,
+                   help="Weight for known-region GT anchor on student fine head")
+    p.add_argument("--kd-known-region-kernel-size", type=int, default=None,
+                   help="Kernel size for binary erosion to construct known regions")
+    p.add_argument("--kd-teacher-fg-reject-threshold", type=float, default=None,
+                   help="Teacher false negative reject threshold (default 0.2)")
+    p.add_argument("--kd-teacher-bg-reject-threshold", type=float, default=None,
+                   help="Teacher false positive reject threshold (default 0.8)")
+    p.add_argument("--kd-disagreement-weight", type=float, default=None,
+                   help="Loss multiplier in teacher-GT disagreement regions (default 0.0)")
+    p.add_argument("--kd-disagreement-gradient-radius", type=int, default=None,
+                   help="Dilation radius to mask disagreement neighborhood for gradient KD")
     p.add_argument("--mask-subdir", type=str, default=None,
                    help="Subdirectory under dataset root containing ground truth masks/alphas")
     p.add_argument("--load-as-alpha", action="store_true", default=None,
@@ -1745,6 +1873,18 @@ def main() -> None:
         cfg.kd_fine_gradient_weight = args.kd_fine_gradient_weight
     if args.kd_edge_extra_weight is not None:
         cfg.kd_edge_extra_weight = args.kd_edge_extra_weight
+    if args.kd_known_region_anchor_weight is not None:
+        cfg.kd_known_region_anchor_weight = args.kd_known_region_anchor_weight
+    if args.kd_known_region_kernel_size is not None:
+        cfg.kd_known_region_kernel_size = args.kd_known_region_kernel_size
+    if args.kd_teacher_fg_reject_threshold is not None:
+        cfg.kd_teacher_fg_reject_threshold = args.kd_teacher_fg_reject_threshold
+    if args.kd_teacher_bg_reject_threshold is not None:
+        cfg.kd_teacher_bg_reject_threshold = args.kd_teacher_bg_reject_threshold
+    if args.kd_disagreement_weight is not None:
+        cfg.kd_disagreement_weight = args.kd_disagreement_weight
+    if args.kd_disagreement_gradient_radius is not None:
+        cfg.kd_disagreement_gradient_radius = args.kd_disagreement_gradient_radius
 
     # Warn about ignored kd-alpha if dual_head_softmap is used
     if cfg.kd_objective == "dual_head_softmap" and args.kd_alpha is not None:
