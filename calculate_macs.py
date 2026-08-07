@@ -90,6 +90,7 @@ def main():
     parser = argparse.ArgumentParser(description="Calculate Fast-SCNN MACs at custom resolution")
     parser.add_argument("--width", "-W", type=int, default=224, help="Target input width (default: 224)")
     parser.add_argument("--height", "-H", type=int, default=128, help="Target input height (default: 128)")
+    parser.add_argument("--fine-image-reference", action="store_true", help="Enable BiRef-Lite Gated Image Reference branch in MAC calculation")
     args = parser.parse_args()
 
     width = args.width
@@ -97,6 +98,8 @@ def main():
 
     device = torch.device("cpu")
     cfg = Config()
+    if args.fine_image_reference:
+        cfg.fine_image_reference = True
     
     # Target resolution
     input_size = (1, 3, height, width)
