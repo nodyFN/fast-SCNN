@@ -243,6 +243,12 @@ class Config:
     kd_teacher_bg_reject_threshold: float = 0.8
     kd_disagreement_weight: float = 0.0
     kd_disagreement_gradient_radius: int = 1
+    fine_image_reference: bool = False
+    fine_image_ref_h4_channels: int = 16
+    fine_image_ref_h2_channels: int = 8
+    fine_image_ref_full_channels: int = 8
+    fine_image_ref_gate_floor: float = 0.25
+    fine_image_ref_init_scale: float = 0.0
     mask_subdir: str = "masks"
     load_as_alpha: bool = False
     prompt_detach: bool = True

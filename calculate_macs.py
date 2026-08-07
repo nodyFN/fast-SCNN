@@ -127,6 +127,12 @@ def main():
         prompt_detach=cfg.prompt_detach,
         uncertainty_floor=cfg.uncertainty_floor,
         resolution_hierarchy=False, # Force Single-Stage
+        fine_image_reference=cfg.fine_image_reference,
+        fine_image_ref_h4_channels=cfg.fine_image_ref_h4_channels,
+        fine_image_ref_h2_channels=cfg.fine_image_ref_h2_channels,
+        fine_image_ref_full_channels=cfg.fine_image_ref_full_channels,
+        fine_image_ref_gate_floor=cfg.fine_image_ref_gate_floor,
+        fine_image_ref_init_scale=cfg.fine_image_ref_init_scale,
     ).to(device)
     model_dh.eval()
     
@@ -148,6 +154,12 @@ def main():
         prompt_detach=cfg.prompt_detach,
         uncertainty_floor=cfg.uncertainty_floor,
         resolution_hierarchy=True, # Force Two-Stage
+        fine_image_reference=cfg.fine_image_reference,
+        fine_image_ref_h4_channels=cfg.fine_image_ref_h4_channels,
+        fine_image_ref_h2_channels=cfg.fine_image_ref_h2_channels,
+        fine_image_ref_full_channels=cfg.fine_image_ref_full_channels,
+        fine_image_ref_gate_floor=cfg.fine_image_ref_gate_floor,
+        fine_image_ref_init_scale=cfg.fine_image_ref_init_scale,
     ).to(device)
     model_ts.eval()
     

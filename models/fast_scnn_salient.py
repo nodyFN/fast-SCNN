@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -267,6 +267,100 @@ class LegacyRefinementHead(nn.Module):
 RefinementHead = LegacyRefinementHead
 
 
+def make_patch_reference(
+    image: torch.Tensor,
+    factor: int,
+    target_size: Tuple[int, int],
+) -> torch.Tensor:
+    """Extract patch representation using pixel_unshuffle and replicate padding."""
+    _, _, h, w = image.shape
+    pad_h = (factor - (h % factor)) % factor
+    pad_w = (factor - (w % factor)) % factor
+    if pad_h > 0 or pad_w > 0:
+        # padding layout: (left, right, top, bottom)
+        image = F.pad(image, (0, pad_w, 0, pad_h), mode="replicate")
+    ref = F.pixel_unshuffle(image, downscale_factor=factor)
+    if ref.shape[-2:] != target_size:
+        ref = F.interpolate(
+            ref,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+    return ref
+
+
+class GatedImageReferenceFusion(nn.Module):
+    """Lite gated image reference fusion block using residual projection and spatial gating."""
+
+    def __init__(
+        self,
+        ref_in_channels: int,
+        ref_channels: int,
+        stage_channels: int,
+        gate_floor: float,
+        init_scale: float,
+        ref_kernel_size: int = 1,
+    ) -> None:
+        super().__init__()
+        if not 0.0 <= gate_floor < 1.0:
+            raise ValueError(f"gate_floor must be in [0, 1), got {gate_floor}")
+
+        self.gate_floor = gate_floor
+
+        self.ref_encoder = ConvBNReLU(
+            ref_in_channels,
+            ref_channels,
+            kernel_size=ref_kernel_size,
+            stride=1,
+            padding=ref_kernel_size // 2,
+        )
+        self.ref_residual_proj = nn.Conv2d(
+            ref_channels,
+            stage_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        # Concatenates stage_channels + ref_channels + 1 (coarse prompt)
+        self.gate_conv = nn.Conv2d(
+            stage_channels + ref_channels + 1,
+            1,
+            kernel_size=1,
+        )
+        self.residual_scale = nn.Parameter(
+            torch.tensor(init_scale, dtype=torch.float32)
+        )
+
+    def forward(
+        self,
+        base_feature: torch.Tensor,
+        reference_input: torch.Tensor,
+        coarse_prompt: torch.Tensor,
+    ) -> torch.Tensor:
+        ref_feature = self.ref_encoder(reference_input)
+        ref_residual = self.ref_residual_proj(ref_feature)
+
+        prompt = F.interpolate(
+            coarse_prompt,
+            size=base_feature.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        gate_input = torch.cat(
+            [
+                base_feature,
+                ref_feature,
+                prompt,
+            ],
+            dim=1,
+        )
+        gate = torch.sigmoid(self.gate_conv(gate_input))
+        effective_gate = self.gate_floor + (1.0 - self.gate_floor) * gate
+        gain = torch.tanh(self.residual_scale)
+
+        return base_feature + gain * effective_gate * ref_residual
+
+
 class MultiscaleRefinementHead(nn.Module):
     """Upgrade Decoder — multi-scale feature refinement leveraging H/2, H/4, and H/8 features."""
     def __init__(
@@ -284,11 +378,18 @@ class MultiscaleRefinementHead(nn.Module):
         prompt_gate_mode: str = "bidirectional",
         prompt_gate_strength: float = 0.5,
         resolution_hierarchy: bool = True,
+        fine_image_reference: bool = False,
+        fine_image_ref_h4_channels: int = 16,
+        fine_image_ref_h2_channels: int = 8,
+        fine_image_ref_full_channels: int = 8,
+        fine_image_ref_gate_floor: float = 0.25,
+        fine_image_ref_init_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.prompt_gate_mode = prompt_gate_mode
         self.prompt_gate_strength = prompt_gate_strength
         self.resolution_hierarchy = resolution_hierarchy
+        self.fine_image_reference = fine_image_reference
 
         extra_channels = 3 if resolution_hierarchy else 1
         # H/8 Block: Concat(F_attended, alpha_prompt, uncertainty, boundary) -> (in_channels + extra_channels) to refine_h8_channels
@@ -331,6 +432,33 @@ class MultiscaleRefinementHead(nn.Module):
             refine_h2_channels, fine_output_channels,
             kernel_size=3, stride=1, padding=1,
         )
+
+        if fine_image_reference:
+            self.ref_fusion_h4 = GatedImageReferenceFusion(
+                ref_in_channels=48,
+                ref_channels=fine_image_ref_h4_channels,
+                stage_channels=refine_h4_channels,
+                gate_floor=fine_image_ref_gate_floor,
+                init_scale=fine_image_ref_init_scale,
+                ref_kernel_size=1,
+            )
+            self.ref_fusion_h2 = GatedImageReferenceFusion(
+                ref_in_channels=12,
+                ref_channels=fine_image_ref_h2_channels,
+                stage_channels=refine_h2_channels,
+                gate_floor=fine_image_ref_gate_floor,
+                init_scale=fine_image_ref_init_scale,
+                ref_kernel_size=1,
+            )
+            self.ref_fusion_full = GatedImageReferenceFusion(
+                ref_in_channels=3,
+                ref_channels=fine_image_ref_full_channels,
+                stage_channels=fine_output_channels,
+                gate_floor=fine_image_ref_gate_floor,
+                init_scale=fine_image_ref_init_scale,
+                ref_kernel_size=3,
+            )
+
         self.dropout = nn.Dropout2d(p=fine_dropout) if fine_dropout > 0 else nn.Identity()
         self.pred_conv = nn.Conv2d(fine_output_channels, 1, kernel_size=1)
 
@@ -343,7 +471,11 @@ class MultiscaleRefinementHead(nn.Module):
         uncertainty_h8: Optional[torch.Tensor] = None,
         boundary_h8: Optional[torch.Tensor] = None,
         input_size: Tuple[int, int] = (512, 1024),
+        input_rgb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.fine_image_reference and input_rgb is None:
+            raise ValueError("input_rgb must be provided when fine_image_reference=True")
+
         # Spatial Attention Gating on feature_h8
         if self.prompt_gate_mode == "bidirectional":
             gate = 1.0 + self.prompt_gate_strength * (2.0 * alpha_prompt_h8 - 1.0)
@@ -371,6 +503,14 @@ class MultiscaleRefinementHead(nn.Module):
         x = self.h4_fusion_proj(x)
         x = self.h4_dsconv(x)
 
+        if self.fine_image_reference:
+            rgb_h4 = make_patch_reference(
+                input_rgb,
+                factor=4,
+                target_size=feature_h4.shape[-2:],
+            )
+            x = self.ref_fusion_h4(x, rgb_h4, alpha_prompt_h8)
+
         # H/2 Skip Fusion
         x = F.interpolate(
             x,
@@ -383,6 +523,14 @@ class MultiscaleRefinementHead(nn.Module):
         x = self.h2_fusion_proj(x)
         x = self.h2_dsconv(x)
 
+        if self.fine_image_reference:
+            rgb_h2 = make_patch_reference(
+                input_rgb,
+                factor=2,
+                target_size=feature_h2.shape[-2:],
+            )
+            x = self.ref_fusion_h2(x, rgb_h2, alpha_prompt_h8)
+
         # Full-resolution Output
         x = F.interpolate(
             x,
@@ -391,6 +539,10 @@ class MultiscaleRefinementHead(nn.Module):
             align_corners=False,
         )
         x = self.out_conv(x)
+
+        if self.fine_image_reference:
+            x = self.ref_fusion_full(x, input_rgb, alpha_prompt_h8)
+
         x = self.dropout(x)
         fine_logits = self.pred_conv(x)
 
@@ -451,12 +603,22 @@ class FastSCNNSalient(nn.Module):
         prompt_detach: bool = True,
         uncertainty_floor: float = 0.15,
         resolution_hierarchy: bool = True,
+        fine_image_reference: bool = False,
+        fine_image_ref_h4_channels: int = 16,
+        fine_image_ref_h2_channels: int = 8,
+        fine_image_ref_full_channels: int = 8,
+        fine_image_ref_gate_floor: float = 0.25,
+        fine_image_ref_init_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.prompt_detach = prompt_detach
         self.uncertainty_floor = uncertainty_floor
         self.resolution_hierarchy = resolution_hierarchy
         self.refinement_head_type = refinement_head
+
+        if refinement_head == "legacy_h8" and fine_image_reference:
+            raise ValueError("BiRef-Lite Image Reference is only supported when refinement_head='multiscale'")
+
         self.backbone = SharedFastSCNNBackbone(
             ppm_pool_sizes=ppm_pool_sizes,
         )
@@ -489,6 +651,12 @@ class FastSCNNSalient(nn.Module):
                 prompt_gate_mode=prompt_gate_mode,
                 prompt_gate_strength=prompt_gate_strength,
                 resolution_hierarchy=resolution_hierarchy,
+                fine_image_reference=fine_image_reference,
+                fine_image_ref_h4_channels=fine_image_ref_h4_channels,
+                fine_image_ref_h2_channels=fine_image_ref_h2_channels,
+                fine_image_ref_full_channels=fine_image_ref_full_channels,
+                fine_image_ref_gate_floor=fine_image_ref_gate_floor,
+                fine_image_ref_init_scale=fine_image_ref_init_scale,
             )
         else:
             raise ValueError(f"Unknown refinement_head: {refinement_head}")
@@ -553,7 +721,8 @@ class FastSCNNSalient(nn.Module):
             if self.refinement_head_type == "multiscale":
                 fine_logits = self.refinement_head(
                     shared_feature, feature_h4, feature_h2,
-                    coarse_prompt, None, None, input_size
+                    coarse_prompt, None, None, input_size,
+                    input_rgb=x
                 )
             else:
                 fine_logits_lowres = self.refinement_head(
@@ -629,7 +798,8 @@ class FastSCNNSalient(nn.Module):
             residual_logits = self.refinement_head(
                 feature_h8, feature_h4, feature_h2,
                 alpha_prompt_h8, uncertainty_h8, boundary_h8,
-                input_size
+                input_size,
+                input_rgb=x
             )
         else:
             residual_logits = self.refinement_head(

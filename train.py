@@ -730,6 +730,12 @@ def run_smoke_test(cfg: Config) -> None:
             prompt_detach=getattr(cfg, "prompt_detach", True),
             uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
             resolution_hierarchy=getattr(cfg, "resolution_hierarchy", True),
+            fine_image_reference=getattr(cfg, "fine_image_reference", False),
+            fine_image_ref_h4_channels=getattr(cfg, "fine_image_ref_h4_channels", 16),
+            fine_image_ref_h2_channels=getattr(cfg, "fine_image_ref_h2_channels", 8),
+            fine_image_ref_full_channels=getattr(cfg, "fine_image_ref_full_channels", 8),
+            fine_image_ref_gate_floor=getattr(cfg, "fine_image_ref_gate_floor", 0.25),
+            fine_image_ref_init_scale=getattr(cfg, "fine_image_ref_init_scale", 0.0),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
@@ -1024,6 +1030,12 @@ def train(cfg: Config) -> None:
             prompt_detach=getattr(cfg, "prompt_detach", True),
             uncertainty_floor=getattr(cfg, "uncertainty_floor", 0.15),
             resolution_hierarchy=getattr(cfg, "resolution_hierarchy", True),
+            fine_image_reference=getattr(cfg, "fine_image_reference", False),
+            fine_image_ref_h4_channels=getattr(cfg, "fine_image_ref_h4_channels", 16),
+            fine_image_ref_h2_channels=getattr(cfg, "fine_image_ref_h2_channels", 8),
+            fine_image_ref_full_channels=getattr(cfg, "fine_image_ref_full_channels", 8),
+            fine_image_ref_gate_floor=getattr(cfg, "fine_image_ref_gate_floor", 0.25),
+            fine_image_ref_init_scale=getattr(cfg, "fine_image_ref_init_scale", 0.0),
         ).to(device)
     elif cfg.model == "unet":
         is_salient_task = "salient" in getattr(cfg, "loss_profile", "")
@@ -1683,6 +1695,18 @@ def parse_args() -> argparse.Namespace:
                    help="Loss multiplier in teacher-GT disagreement regions (default 0.0)")
     p.add_argument("--kd-disagreement-gradient-radius", type=int, default=None,
                    help="Dilation radius to mask disagreement neighborhood for gradient KD")
+    p.add_argument("--fine-image-reference", action="store_true", dest="fine_image_reference", default=None,
+                   help="Enable BiRef-Lite Gated Image Reference on Fine Head")
+    p.add_argument("--fine-image-ref-h4-channels", type=int, default=None,
+                   help="Number of reference projection channels for H/4 stage")
+    p.add_argument("--fine-image-ref-h2-channels", type=int, default=None,
+                   help="Number of reference projection channels for H/2 stage")
+    p.add_argument("--fine-image-ref-full-channels", type=int, default=None,
+                   help="Number of reference projection channels for Full stage")
+    p.add_argument("--fine-image-ref-gate-floor", type=float, default=None,
+                   help="Minimum gate value for image reference fusion")
+    p.add_argument("--fine-image-ref-init-scale", type=float, default=None,
+                   help="Initial scale value for reference residual connection")
     p.add_argument("--mask-subdir", type=str, default=None,
                    help="Subdirectory under dataset root containing ground truth masks/alphas")
     p.add_argument("--load-as-alpha", action="store_true", default=None,
@@ -1885,6 +1909,18 @@ def main() -> None:
         cfg.kd_disagreement_weight = args.kd_disagreement_weight
     if args.kd_disagreement_gradient_radius is not None:
         cfg.kd_disagreement_gradient_radius = args.kd_disagreement_gradient_radius
+    if args.fine_image_reference is not None:
+        cfg.fine_image_reference = args.fine_image_reference
+    if args.fine_image_ref_h4_channels is not None:
+        cfg.fine_image_ref_h4_channels = args.fine_image_ref_h4_channels
+    if args.fine_image_ref_h2_channels is not None:
+        cfg.fine_image_ref_h2_channels = args.fine_image_ref_h2_channels
+    if args.fine_image_ref_full_channels is not None:
+        cfg.fine_image_ref_full_channels = args.fine_image_ref_full_channels
+    if args.fine_image_ref_gate_floor is not None:
+        cfg.fine_image_ref_gate_floor = args.fine_image_ref_gate_floor
+    if args.fine_image_ref_init_scale is not None:
+        cfg.fine_image_ref_init_scale = args.fine_image_ref_init_scale
 
     # Warn about ignored kd-alpha if dual_head_softmap is used
     if cfg.kd_objective == "dual_head_softmap" and args.kd_alpha is not None:
