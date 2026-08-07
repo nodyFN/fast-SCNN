@@ -239,6 +239,11 @@ class Config:
     kd_edge_extra_weight: float = 4.0
     kd_known_region_anchor_weight: float = 0.2
     kd_known_region_kernel_size: int = 5
+    kd_boundary_side_weight: float = 0.0
+    kd_boundary_side_kernel_size: int = 3
+    kd_cross_boundary_ranking_weight: float = 0.0
+    kd_cross_boundary_ranking_margin: float = 0.3
+    kd_cross_boundary_ranking_radius: int = 2
     kd_teacher_fg_reject_threshold: float = 0.2
     kd_teacher_bg_reject_threshold: float = 0.8
     kd_disagreement_weight: float = 0.0

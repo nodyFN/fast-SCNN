@@ -273,12 +273,103 @@ def train_one_epoch(
                         bg_mask=known_bg,
                     )
                     
+                    # Boundary-Side Balanced BCE
+                    eroded = binary_erode(gt_binary, kernel_size=cfg.kd_boundary_side_kernel_size)
+                    dilated = binary_dilate(gt_binary, radius=cfg.kd_boundary_side_kernel_size // 2)
+                    inner_fg = (gt_binary - eroded).clamp(0.0, 1.0)
+                    outer_bg = (dilated - gt_binary).clamp(0.0, 1.0)
+                    
+                    boundary_side_loss = masked_balanced_bce_with_logits(
+                        logits=student_fine_logits,
+                        targets=gt_binary,
+                        fg_mask=inner_fg,
+                        bg_mask=outer_bg,
+                    )
+                    
+                    # Cross-Boundary Ranking Loss
+                    bg_score = student_fine_prob.masked_fill(outer_bg < 0.5, -1e9)
+                    rank_kernel_size = 2 * cfg.kd_cross_boundary_ranking_radius + 1
+                    local_hard_bg = F.max_pool2d(
+                        bg_score,
+                        kernel_size=rank_kernel_size,
+                        stride=1,
+                        padding=cfg.kd_cross_boundary_ranking_radius,
+                    )
+                    has_local_bg = F.max_pool2d(
+                        outer_bg,
+                        kernel_size=rank_kernel_size,
+                        stride=1,
+                        padding=cfg.kd_cross_boundary_ranking_radius,
+                    ) > 0.5
+                    
+                    valid_mask = (inner_fg >= 0.5) & has_local_bg
+                    pixel_rank_loss = F.relu(cfg.kd_cross_boundary_ranking_margin - (student_fine_prob - local_hard_bg))
+                    
+                    rank_sum = (pixel_rank_loss * valid_mask.float()).sum(dim=(1, 2, 3))
+                    valid_count = valid_mask.float().sum(dim=(1, 2, 3))
+                    ranking_loss = torch.where(
+                        valid_count > 0,
+                        rank_sum / valid_count.clamp_min(1.0),
+                        torch.zeros_like(rank_sum)
+                    ).mean()
+                    
+                    # Calculate new metrics for logging
+                    with torch.no_grad():
+                        bce_all = F.binary_cross_entropy_with_logits(student_fine_logits, gt_binary, reduction="none")
+                        
+                        inner_fg_count = inner_fg.sum(dim=(1, 2, 3))
+                        inner_fg_loss_sum = (bce_all * inner_fg).sum(dim=(1, 2, 3))
+                        boundary_inner_fg_loss = torch.where(
+                            inner_fg_count > 0,
+                            inner_fg_loss_sum / inner_fg_count.clamp_min(1.0),
+                            torch.zeros_like(inner_fg_loss_sum)
+                        ).mean()
+                        
+                        outer_bg_count = outer_bg.sum(dim=(1, 2, 3))
+                        outer_bg_loss_sum = (bce_all * outer_bg).sum(dim=(1, 2, 3))
+                        boundary_outer_bg_loss = torch.where(
+                            outer_bg_count > 0,
+                            outer_bg_loss_sum / outer_bg_count.clamp_min(1.0),
+                            torch.zeros_like(outer_bg_loss_sum)
+                        ).mean()
+                        
+                        boundary_inner_ratio = inner_fg.mean()
+                        boundary_outer_ratio = outer_bg.mean()
+                        cross_boundary_valid_ratio = valid_mask.float().mean()
+                        
+                        fg_prob_sum = (student_fine_prob * inner_fg).sum(dim=(1, 2, 3))
+                        boundary_fg_prob_mean = torch.where(
+                            inner_fg_count > 0,
+                            fg_prob_sum / inner_fg_count.clamp_min(1.0),
+                            torch.zeros_like(fg_prob_sum)
+                        ).mean()
+                        
+                        bg_prob_sum = (student_fine_prob * outer_bg).sum(dim=(1, 2, 3))
+                        boundary_bg_prob_mean = torch.where(
+                            outer_bg_count > 0,
+                            bg_prob_sum / outer_bg_count.clamp_min(1.0),
+                            torch.zeros_like(bg_prob_sum)
+                        ).mean()
+                        
+                        boundary_probability_gap = boundary_fg_prob_mean - boundary_bg_prob_mean
+                    
                     losses["coarse_gt"] = coarse_gt_loss
                     losses["fine_gt"] = fine_gt_loss
                     losses["kd_map"] = fine_kd_map
                     losses["kd_soft_bce"] = fine_kd_soft_bce
                     losses["kd_gradient"] = fine_kd_gradient
                     losses["fine_known_region_anchor"] = fine_known_region_anchor
+                    
+                    losses["boundary_side"] = boundary_side_loss
+                    losses["boundary_inner_fg"] = boundary_inner_fg_loss
+                    losses["boundary_outer_bg"] = boundary_outer_bg_loss
+                    losses["cross_boundary_rank"] = ranking_loss
+                    losses["cross_boundary_valid_ratio"] = cross_boundary_valid_ratio
+                    losses["boundary_inner_ratio"] = boundary_inner_ratio
+                    losses["boundary_outer_ratio"] = boundary_outer_ratio
+                    losses["boundary_fg_prob_mean"] = boundary_fg_prob_mean
+                    losses["boundary_bg_prob_mean"] = boundary_bg_prob_mean
+                    losses["boundary_probability_gap"] = boundary_probability_gap
                     
                     losses["total"] = (
                         cfg.kd_coarse_gt_weight * coarse_gt_loss
@@ -287,6 +378,8 @@ def train_one_epoch(
                         + cfg.kd_fine_soft_bce_weight * fine_kd_soft_bce
                         + cfg.kd_fine_gradient_weight * fine_kd_gradient
                         + cfg.kd_known_region_anchor_weight * fine_known_region_anchor
+                        + cfg.kd_boundary_side_weight * boundary_side_loss
+                        + cfg.kd_cross_boundary_ranking_weight * ranking_loss
                     )
                     
                     # Compute statistics for logging
@@ -1350,7 +1443,10 @@ def train(cfg: Config) -> None:
                             "coarse_gt", "fine_gt", "kd_map", "kd_soft_bce", "kd_gradient",
                             "teacher_prob_mean", "student_prob_mean", "teacher_fg_mean", "student_fg_mean", "teacher_bg_mean", "student_bg_mean",
                             "fine_known_region_anchor", "teacher_disagreement_ratio", "teacher_false_negative_ratio", "teacher_false_positive_ratio",
-                            "known_fg_ratio", "known_bg_ratio", "kd_valid_ratio"
+                            "known_fg_ratio", "known_bg_ratio", "kd_valid_ratio",
+                            "boundary_side", "boundary_inner_fg", "boundary_outer_bg", "cross_boundary_rank",
+                            "cross_boundary_valid_ratio", "boundary_inner_ratio", "boundary_outer_ratio",
+                            "boundary_fg_prob_mean", "boundary_bg_prob_mean", "boundary_probability_gap"
                         ]:
                             writer.add_scalar(f"train/{k}", v, epoch)
                         else:
@@ -1695,6 +1791,16 @@ def parse_args() -> argparse.Namespace:
                    help="Loss multiplier in teacher-GT disagreement regions (default 0.0)")
     p.add_argument("--kd-disagreement-gradient-radius", type=int, default=None,
                    help="Dilation radius to mask disagreement neighborhood for gradient KD")
+    p.add_argument("--kd-boundary-side-weight", type=float, default=None,
+                   help="Weight for Boundary-Side Balanced BCE loss (default 0.0)")
+    p.add_argument("--kd-boundary-side-kernel-size", type=int, default=None,
+                   help="Kernel size for boundary-side morphology (default 3)")
+    p.add_argument("--kd-cross-boundary-ranking-weight", type=float, default=None,
+                   help="Weight for Cross-Boundary Ranking loss (default 0.0)")
+    p.add_argument("--kd-cross-boundary-ranking-margin", type=float, default=None,
+                   help="Margin for Cross-Boundary Ranking loss (default 0.3)")
+    p.add_argument("--kd-cross-boundary-ranking-radius", type=int, default=None,
+                   help="Radius for Cross-Boundary Ranking loss (default 2)")
     p.add_argument("--fine-image-reference", action="store_true", dest="fine_image_reference", default=None,
                    help="Enable BiRef-Lite Gated Image Reference on Fine Head")
     p.add_argument("--fine-image-ref-h4-channels", type=int, default=None,
@@ -1909,6 +2015,29 @@ def main() -> None:
         cfg.kd_disagreement_weight = args.kd_disagreement_weight
     if args.kd_disagreement_gradient_radius is not None:
         cfg.kd_disagreement_gradient_radius = args.kd_disagreement_gradient_radius
+    if args.kd_boundary_side_weight is not None:
+        cfg.kd_boundary_side_weight = args.kd_boundary_side_weight
+    if args.kd_boundary_side_kernel_size is not None:
+        cfg.kd_boundary_side_kernel_size = args.kd_boundary_side_kernel_size
+    if args.kd_cross_boundary_ranking_weight is not None:
+        cfg.kd_cross_boundary_ranking_weight = args.kd_cross_boundary_ranking_weight
+    if args.kd_cross_boundary_ranking_margin is not None:
+        cfg.kd_cross_boundary_ranking_margin = args.kd_cross_boundary_ranking_margin
+    if args.kd_cross_boundary_ranking_radius is not None:
+        cfg.kd_cross_boundary_ranking_radius = args.kd_cross_boundary_ranking_radius
+
+    # Validation checks
+    if cfg.kd_boundary_side_weight < 0.0:
+        raise ValueError("kd_boundary_side_weight must be >= 0")
+    if cfg.kd_boundary_side_kernel_size < 1 or cfg.kd_boundary_side_kernel_size % 2 == 0:
+        raise ValueError("kd_boundary_side_kernel_size must be >= 1 and odd")
+    if cfg.kd_cross_boundary_ranking_weight < 0.0:
+        raise ValueError("kd_cross_boundary_ranking_weight must be >= 0")
+    if cfg.kd_cross_boundary_ranking_margin < 0.0:
+        raise ValueError("kd_cross_boundary_ranking_margin must be >= 0")
+    if cfg.kd_cross_boundary_ranking_radius < 1:
+        raise ValueError("kd_cross_boundary_ranking_radius must be >= 1")
+
     if args.fine_image_reference is not None:
         cfg.fine_image_reference = args.fine_image_reference
     if args.fine_image_ref_h4_channels is not None:
