@@ -287,7 +287,7 @@ def train_one_epoch(
                     )
                     
                     # Cross-Boundary Ranking Loss
-                    bg_score = student_fine_prob.masked_fill(outer_bg < 0.5, -1e9)
+                    bg_score = student_fine_prob.masked_fill(outer_bg < 0.5, -100.0)
                     rank_kernel_size = 2 * cfg.kd_cross_boundary_ranking_radius + 1
                     local_hard_bg = F.max_pool2d(
                         bg_score,

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from utils.losses import binary_erode, binary_dilate, masked_balanced_bce_with_logits
 
 def compute_ranking_loss(student_fine_prob, inner_fg, outer_bg, margin, radius):
-    bg_score = student_fine_prob.masked_fill(outer_bg < 0.5, -1e9)
+    bg_score = student_fine_prob.masked_fill(outer_bg < 0.5, -100.0)
     rank_kernel_size = 2 * radius + 1
     local_hard_bg = F.max_pool2d(
         bg_score,
