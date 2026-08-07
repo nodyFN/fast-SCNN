@@ -600,6 +600,12 @@ def main() -> None:
             prompt_detach=checkpoint_config.get("prompt_detach", True),
             uncertainty_floor=checkpoint_config.get("uncertainty_floor", 0.15),
             resolution_hierarchy=detected_resolution_hierarchy,
+            fine_image_reference=checkpoint_config.get("fine_image_reference", False),
+            fine_image_ref_h4_channels=checkpoint_config.get("fine_image_ref_h4_channels", 16),
+            fine_image_ref_h2_channels=checkpoint_config.get("fine_image_ref_h2_channels", 8),
+            fine_image_ref_full_channels=checkpoint_config.get("fine_image_ref_full_channels", 8),
+            fine_image_ref_gate_floor=checkpoint_config.get("fine_image_ref_gate_floor", 0.25),
+            fine_image_ref_init_scale=checkpoint_config.get("fine_image_ref_init_scale", 0.0),
         ).to(device)
     else:
         model = FastSCNN(num_classes=args.num_classes, aux=False).to(device)

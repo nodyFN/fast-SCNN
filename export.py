@@ -101,6 +101,12 @@ def export_onnx(
             refine_h2_channels=checkpoint_config.get("refine_h2_channels", 32),
             fine_output_channels=checkpoint_config.get("fine_output_channels", 24),
             fine_dropout=checkpoint_config.get("fine_dropout", 0.1),
+            fine_image_reference=checkpoint_config.get("fine_image_reference", False),
+            fine_image_ref_h4_channels=checkpoint_config.get("fine_image_ref_h4_channels", 16),
+            fine_image_ref_h2_channels=checkpoint_config.get("fine_image_ref_h2_channels", 8),
+            fine_image_ref_full_channels=checkpoint_config.get("fine_image_ref_full_channels", 8),
+            fine_image_ref_gate_floor=checkpoint_config.get("fine_image_ref_gate_floor", 0.25),
+            fine_image_ref_init_scale=checkpoint_config.get("fine_image_ref_init_scale", 0.0),
         ).to(device)
     else:
         model = FastSCNN(num_classes=num_classes, aux=True).to(device)
@@ -184,12 +190,36 @@ def validate_onnx(
     device = torch.device(device_str if device_str != "cuda" or torch.cuda.is_available() else "cpu")
     
     cfg = Config()
+    checkpoint_config = {}
+    if checkpoint_path:
+        ckpt_meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_config = ckpt_meta.get("config", {})
+
     if model_name == "fast_scnn_salient":
         model = FastSCNNSalient(
-            ppm_pool_sizes=cfg.ppm_pool_sizes,
-            coarse_channels=cfg.coarse_channels,
-            refinement_channels=cfg.refinement_channels,
-            dropout_p=cfg.dropout_p,
+            ppm_pool_sizes=checkpoint_config.get("ppm_pool_sizes", cfg.ppm_pool_sizes),
+            coarse_channels=checkpoint_config.get("coarse_channels", cfg.coarse_channels),
+            refinement_channels=checkpoint_config.get("refinement_channels", cfg.refinement_channels),
+            dropout_p=checkpoint_config.get("dropout_p", cfg.dropout_p),
+            refinement_head=checkpoint_config.get("refinement_head", cfg.refinement_head),
+            prompt_gate_mode=checkpoint_config.get("prompt_gate_mode", cfg.prompt_gate_mode),
+            prompt_gate_strength=checkpoint_config.get("prompt_gate_strength", cfg.prompt_gate_strength),
+            refine_h8_channels=checkpoint_config.get("refine_h8_channels", cfg.refine_h8_channels),
+            h4_skip_channels=checkpoint_config.get("h4_skip_channels", cfg.h4_skip_channels),
+            refine_h4_channels=checkpoint_config.get("refine_h4_channels", cfg.refine_h4_channels),
+            h2_skip_channels=checkpoint_config.get("h2_skip_channels", cfg.h2_skip_channels),
+            refine_h2_channels=checkpoint_config.get("refine_h2_channels", cfg.refine_h2_channels),
+            fine_output_channels=checkpoint_config.get("fine_output_channels", cfg.fine_output_channels),
+            fine_dropout=checkpoint_config.get("fine_dropout", cfg.fine_dropout),
+            prompt_detach=checkpoint_config.get("prompt_detach", cfg.prompt_detach),
+            uncertainty_floor=checkpoint_config.get("uncertainty_floor", cfg.uncertainty_floor),
+            resolution_hierarchy=checkpoint_config.get("resolution_hierarchy", cfg.resolution_hierarchy),
+            fine_image_reference=checkpoint_config.get("fine_image_reference", False),
+            fine_image_ref_h4_channels=checkpoint_config.get("fine_image_ref_h4_channels", 16),
+            fine_image_ref_h2_channels=checkpoint_config.get("fine_image_ref_h2_channels", 8),
+            fine_image_ref_full_channels=checkpoint_config.get("fine_image_ref_full_channels", 8),
+            fine_image_ref_gate_floor=checkpoint_config.get("fine_image_ref_gate_floor", 0.25),
+            fine_image_ref_init_scale=checkpoint_config.get("fine_image_ref_init_scale", 0.0),
         ).to(device)
     else:
         model = FastSCNN(num_classes=num_classes, aux=True).to(device)
