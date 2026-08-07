@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import pandas as pd
+import argparse
 from pathlib import Path
 
 from config import Config
@@ -9,9 +10,10 @@ from models.fast_scnn import FastSCNN
 from models.fast_scnn_salient import FastSCNNSalient
 
 class MACProfiler:
-    def __init__(self, model, resolution_hierarchy_enabled=False):
+    def __init__(self, model, resolution_hierarchy_enabled=False, input_height=128):
         self.model = model
         self.resolution_hierarchy_enabled = resolution_hierarchy_enabled
+        self.input_height = input_height
         self.records = []
         self.hooks = []
         self.register_hooks(self.model, "")
@@ -57,8 +59,8 @@ class MACProfiler:
             if self.resolution_hierarchy_enabled:
                 if in_shape:
                     h = in_shape[-2]
-                    # If input height is 64 (or 0.5x of 128), it's Stage 0 (Coarse)
-                    if h <= 64:
+                    # If input height is <= 0.5x of input_height, it's Stage 0 (Coarse)
+                    if h <= self.input_height // 2:
                         stage = "Stage 0 (Coarse)"
                     else:
                         stage = "Stage 1 (Fine)"
@@ -85,11 +87,19 @@ class MACProfiler:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Calculate Fast-SCNN MACs at custom resolution")
+    parser.add_argument("--width", "-W", type=int, default=224, help="Target input width (default: 224)")
+    parser.add_argument("--height", "-H", type=int, default=128, help="Target input height (default: 128)")
+    args = parser.parse_args()
+
+    width = args.width
+    height = args.height
+
     device = torch.device("cpu")
     cfg = Config()
     
-    # Target resolution: w=224, h=128
-    input_size = (1, 3, 128, 224)
+    # Target resolution
+    input_size = (1, 3, height, width)
     x = torch.randn(input_size)
     
     print("Initializing models...")
@@ -142,21 +152,21 @@ def main():
     model_ts.eval()
     
     print("Profiling Original Fast-SCNN...")
-    profiler_orig = MACProfiler(model_orig, resolution_hierarchy_enabled=False)
+    profiler_orig = MACProfiler(model_orig, resolution_hierarchy_enabled=False, input_height=height)
     with torch.no_grad():
         model_orig(x)
     profiler_orig.remove_hooks()
     df_orig = pd.DataFrame(profiler_orig.records)
     
     print("Profiling Fast-SCNN Dual Head...")
-    profiler_dh = MACProfiler(model_dh, resolution_hierarchy_enabled=False)
+    profiler_dh = MACProfiler(model_dh, resolution_hierarchy_enabled=False, input_height=height)
     with torch.no_grad():
         model_dh(x)
     profiler_dh.remove_hooks()
     df_dh = pd.DataFrame(profiler_dh.records)
     
     print("Profiling Fast-SCNN Two-Stage...")
-    profiler_ts = MACProfiler(model_ts, resolution_hierarchy_enabled=True)
+    profiler_ts = MACProfiler(model_ts, resolution_hierarchy_enabled=True, input_height=height)
     with torch.no_grad():
         model_ts(x)
     profiler_ts.remove_hooks()
@@ -182,7 +192,7 @@ def main():
     df_ts_sum = append_summary(df_ts)
     
     # Output to Excel file
-    output_excel = "fast_scnn_macs_224x128.xlsx"
+    output_excel = f"fast_scnn_macs_{width}x{height}.xlsx"
     print(f"Saving results to {output_excel}...")
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
         df_orig_sum.to_excel(writer, sheet_name="original_fast_scnn", index=False)
@@ -192,7 +202,7 @@ def main():
     print("Done! Excel file generated successfully.")
     
     # Print high-level summaries
-    print("\nHigh-Level MACs Summary (Input Size: 224x128):")
+    print(f"\nHigh-Level MACs Summary (Input Size: {width}x{height}):")
     print(f"1. Original Fast-SCNN          : {df_orig['MACs'].sum():,} MACs")
     print(f"2. Fast-SCNN Dual Head (1-stage): {df_dh['MACs'].sum():,} MACs")
     print(f"3. Fast-SCNN Two-Stage (2-stage): {df_ts['MACs'].sum():,} MACs")
